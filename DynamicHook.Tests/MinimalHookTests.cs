@@ -129,26 +129,66 @@ namespace DynamicHook.Tests
                 hook.Install();
                 _output.WriteLine(hook.DiagInfo.ToString());
 
-                // 尝试直接调用
+                // Test 1: direct call after hook install
                 var list = new List<int> { 1, 2, 3 };
-                var result = list.ConvertAll(x => x.ToString());
+                var result = list.ConvertAll(new Converter<int, string>(x => x.ToString()));
                 _output.WriteLine($"Direct call result count: {result.Count}");
                 _output.WriteLine($"Direct call result: [{string.Join(",", result)}]");
 
-                // 尝试通过反射调用
-                var reflResult = (List<string>)genericTarget.Invoke(list, new object[] { new Converter<int, string>(x => x.ToString()) });
-                _output.WriteLine($"Reflection call result count: {reflResult.Count}");
-                _output.WriteLine($"Reflection call result: [{string.Join(",", reflResult)}]");
-
                 Assert.Single(result);
                 Assert.Equal("HOOKED_CONVERTALL", result[0]);
+
+                // Test 2: delegate call after hook install
+                var delType = typeof(Func<List<int>, Converter<int, string>, List<string>>);
+                var del = (Func<List<int>, Converter<int, string>, List<string>>)
+                    genericTarget.CreateDelegate(delType);
+                var list2 = new List<int> { 4, 5, 6 };
+                var result2 = del(list2, new Converter<int, string>(x => x.ToString()));
+                _output.WriteLine($"Delegate call result count: {result2.Count}");
+                _output.WriteLine($"Delegate call result: [{string.Join(",", result2)}]");
+
+                Assert.Single(result2);
+                Assert.Equal("HOOKED_CONVERTALL", result2[0]);
             }
 
             // 卸载后
-            var list2 = new List<int> { 10, 20 };
-            var result2 = list2.ConvertAll(x => x.ToString());
-            _output.WriteLine($"After uninstall: [{string.Join(",", result2)}]");
-            Assert.Equal(2, result2.Count);
+            var list3 = new List<int> { 10, 20 };
+            var result3 = list3.ConvertAll(x => x.ToString());
+            _output.WriteLine($"After uninstall: [{string.Join(",", result3)}]");
+            Assert.Equal(2, result3.Count);
+        }
+
+        // ===== 诊断测试：验证 MethodInfo.Invoke 对泛型方法是否工作 =====
+        [Fact]
+        public void Diag_Invoke_GenericMethod_NoHook()
+        {
+            var openMethod = typeof(List<int>).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "ConvertAll" && m.IsGenericMethod);
+            Assert.NotNull(openMethod);
+            var genericMethod = openMethod.MakeGenericMethod(typeof(string));
+
+            var list = new List<int> { 1, 2, 3 };
+            var converter = new Converter<int, string>(x => $"item{x}");
+
+            // 1. 直接调用
+            var directResult = list.ConvertAll(converter);
+            _output.WriteLine($"Direct call: [{string.Join(",", directResult)}]");
+            Assert.Equal(3, directResult.Count);
+
+            // 2. MethodInfo.Invoke 调用（无 hook）
+            var invokeResult = (List<string>)genericMethod.Invoke(list, new object[] { converter });
+            _output.WriteLine($"Invoke call: [{string.Join(",", invokeResult)}]");
+            Assert.Equal(3, invokeResult.Count);
+
+            // 3. Delegate.CreateDelegate + DynamicInvoke（无 hook）
+            var delegateType = typeof(Func<,,>).MakeGenericType(typeof(List<int>), typeof(Converter<int, string>), typeof(List<string>));
+            var del = Delegate.CreateDelegate(delegateType, genericMethod, throwOnBindFailure: false);
+            Assert.NotNull(del);
+            var dynResult = del.DynamicInvoke(list, converter);
+            _output.WriteLine($"DynamicInvoke call: {dynResult}");
+            Assert.NotNull(dynResult);
+
+            _output.WriteLine("All invoke methods work without hook.");
         }
     }
 }

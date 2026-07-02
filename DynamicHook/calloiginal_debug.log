@@ -1,9 +1,0 @@
-23:36:31.694 CallOriginal START, mi=System.Collections.Generic.List`1[System.String] ConvertAll[String](System.Converter`2[System.Int32,System.String]), hasSecondary=True
-23:36:31.697 CallOriginal before RestoreAll
-23:36:31.710 CallOriginal after RestoreAll
-23:36:31.724 CallOriginal instance != null: True
-23:36:31.773 CallOriginal args count: 1
-23:36:31.782 CallOriginal before GC.Collect
-11:11:20.911 CallOriginal start: isGeneric=True hasSecondary=True jitAddr=0x7FFED3B3DE40
-11:11:20.969 CallOriginal: after RestoreAll, about to invoke
-11:11:20.985 CallOriginal: invoking via delegate (generic)

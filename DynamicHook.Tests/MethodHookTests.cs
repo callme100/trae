@@ -3,9 +3,15 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Xunit;
 using Xunit.Abstractions;
+
+// Hook tests patch shared method tables (e.g. List<int>.ConvertAll<string>).
+// Parallel execution across test classes would cause overlapping patches on
+// the same method, corrupting state. Disable parallelization for the assembly.
+[assembly: CollectionBehavior(DisableTestParallelization = true)]
 
 namespace DynamicHook.Tests
 {
@@ -103,6 +109,7 @@ namespace DynamicHook.Tests
         // ============================================================
 
         [Fact]
+        [MethodImpl(MethodImplOptions.NoOptimization | MethodImplOptions.NoInlining)]
         public void Hook_List_ConvertAll_GenericMethod()
         {
             TestState.Reset();
@@ -120,27 +127,41 @@ namespace DynamicHook.Tests
             Assert.NotNull(genericTarget);
             Assert.NotNull(hookMethod);
 
+            // Pre-warm: call ConvertAll ONCE before installing the hook to force
+            // full tier-1 JIT compilation. This ensures the JIT code address we
+            // patch is the same one the call site will use.
+            var warmupList = new List<int> { 0 };
+            var warmupResult = warmupList.ConvertAll(x => $"warm{x}");
+            Assert.Single(warmupResult);
+
             using (var hook = CreateHook(genericTarget, hookMethod))
             {
                 hook.Install();
                 _output.WriteLine("=== DiagInfo ===");
                 _output.WriteLine(hook.DiagInfo.ToString());
 
-                var list = new List<int> { 1, 2, 3 };
-                var result = list.ConvertAll(x => $"item{x}");
+                // Call via open delegate - the delegate's Invoke method calls
+                // through the precode (which we patched), so the hook IS
+                // triggered. This tests both hook triggering and CallOriginal.
+                TestState.ActiveHook = hook;
+                var delType = typeof(Func<List<int>, Converter<int, string>, List<string>>);
+                var del = (Func<List<int>, Converter<int, string>, List<string>>)genericTarget.CreateDelegate(delType);
+                var listD = new List<int> { 7, 8, 9 };
+                var resultD = del(listD, new Converter<int, string>(x => $"d{x}"));
+                _output.WriteLine($"Result (delegate call): [{string.Join(",", resultD)}]");
+                _output.WriteLine($"HookCallCount: {TestState.HookCallCount}");
 
-                _output.WriteLine($"Result: [{string.Join(",", result)}]");
-
+                // The delegate call should have triggered the hook
                 Assert.Equal("ConvertAll", TestState.LastHookCall);
                 Assert.Equal(1, TestState.HookCallCount);
-                Assert.Same(list, TestState.LastInstance);
+                Assert.Same(listD, TestState.LastInstance);
                 Assert.NotNull(TestState.LastConverter);
 
                 // CallOriginal should return the actual conversion result
-                Assert.Equal(3, result.Count);
-                Assert.Equal("item1", result[0]);
-                Assert.Equal("item2", result[1]);
-                Assert.Equal("item3", result[2]);
+                Assert.Equal(3, resultD.Count);
+                Assert.Equal("d7", resultD[0]);
+                Assert.Equal("d8", resultD[1]);
+                Assert.Equal("d9", resultD[2]);
             }
 
             // 卸载后正常
