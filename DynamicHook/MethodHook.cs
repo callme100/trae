@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -10,1155 +10,8 @@ using System.Text;
 
 namespace DynamicHook
 {
-    internal static class Platform
-    {
-        public enum Arch
-        {
-            X86,
-            X64,
-            ARM32,
-            ARM64,
-            Unknown
-        }
-
-        private static readonly Lazy<Arch> _current = new Lazy<Arch>(Detect);
-
-        public static Arch Current => _current.Value;
-
-        public static bool Is64Bit => Current == Arch.X64 || Current == Arch.ARM64;
-
-        public static int PatchSize => Current switch
-        {
-            Arch.X64 => 12,
-            Arch.X86 => 5,
-            Arch.ARM64 => 16,
-            Arch.ARM32 => 12,
-            _ => 12,
-        };
-
-        private static Arch Detect()
-        {
-            try
-            {
-                switch (RuntimeInformation.ProcessArchitecture)
-                {
-                    case Architecture.X86:
-                        return Arch.X86;
-                    case Architecture.X64:
-                        return Arch.X64;
-                    case Architecture.Arm:
-                        return Arch.ARM32;
-                    case Architecture.Arm64:
-                        return Arch.ARM64;
-                }
-            }
-            catch
-            {
-            }
-            return (IntPtr.Size == 8) ? Arch.X64 : Arch.X86;
-        }
-    }
-    internal static class Memory
-    {
-        private static readonly IntPtr CurrentProcess = new IntPtr(-1);
-
-        private static int PageSize => 4096;
-
-        public static IntPtr AlignToPage(IntPtr addr)
-        {
-            long num = PageSize;
-            return new IntPtr(addr.ToInt64() / num * num);
-        }
-
-        public static UIntPtr AlignedSize(IntPtr addr, int size)
-        {
-            long num = PageSize;
-            long num2 = AlignToPage(addr).ToInt64();
-            long num3 = addr.ToInt64() + size;
-            return (UIntPtr)(ulong)((num3 - num2 + num - 1) / num * num);
-        }
-
-        public static void ProtectWritable(IntPtr addr, int size)
-        {
-            IntPtr addr2 = AlignToPage(addr);
-            UIntPtr uIntPtr = AlignedSize(addr, size);
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                VirtualProtect(addr2, uIntPtr, 64u, out var _);
-            }
-            else
-            {
-                mprotect(addr2, uIntPtr, 7);
-            }
-        }
-
-        public static void ProtectExecutable(IntPtr addr, int size)
-        {
-            IntPtr addr2 = AlignToPage(addr);
-            UIntPtr uIntPtr = AlignedSize(addr, size);
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                VirtualProtect(addr2, uIntPtr, 64u, out var _);
-                FlushInstructionCache(CurrentProcess, addr, (UIntPtr)(ulong)size);
-            }
-            else
-            {
-                mprotect(addr2, uIntPtr, 7);
-            }
-        }
-
-        public static void ProtectReadWrite(IntPtr addr, int size)
-        {
-            IntPtr addr2 = AlignToPage(addr);
-            UIntPtr uIntPtr = AlignedSize(addr, size);
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                VirtualProtect(addr2, uIntPtr, 64u, out var _);
-            }
-            else
-            {
-                mprotect(addr2, uIntPtr, 7);
-            }
-        }
-
-        public static IntPtr AllocExec(int size)
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                return VirtualAlloc(IntPtr.Zero, (UIntPtr)(ulong)size, 12288u, 64u);
-            }
-            return mmap(IntPtr.Zero, (UIntPtr)(ulong)size, 7, 34, -1, 0L);
-        }
-
-        public static IntPtr AllocExecNear(IntPtr nearAddr, int size)
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                long num = nearAddr.ToInt64();
-                long num2 = (size + 4095) & -4096;
-                long num3 = num - 2147418112;
-                if (num3 < 65536)
-                {
-                    num3 = 65536L;
-                }
-                long num4 = num + 2147418112;
-                for (long num5 = 0L; num5 < 2147418112; num5 += 65536)
-                {
-                    long num6 = num + num5;
-                    if (num6 >= num3 && num6 + num2 <= num4)
-                    {
-                        IntPtr intPtr = VirtualAlloc(new IntPtr(num6), (UIntPtr)(ulong)num2, 12288u, 64u);
-                        if (intPtr != IntPtr.Zero)
-                        {
-                            long num7 = intPtr.ToInt64() - num;
-                            if (num7 >= -2147483647 && num7 <= int.MaxValue)
-                            {
-                                return intPtr;
-                            }
-                            VirtualFree(intPtr, UIntPtr.Zero, 32768u);
-                        }
-                    }
-                    if (num5 <= 0)
-                    {
-                        continue;
-                    }
-                    num6 = num - num5;
-                    if (num6 < num3 || num6 + num2 > num4)
-                    {
-                        continue;
-                    }
-                    IntPtr intPtr2 = VirtualAlloc(new IntPtr(num6), (UIntPtr)(ulong)num2, 12288u, 64u);
-                    if (intPtr2 != IntPtr.Zero)
-                    {
-                        long num8 = intPtr2.ToInt64() - num;
-                        if (num8 >= -2147483647 && num8 <= int.MaxValue)
-                        {
-                            return intPtr2;
-                        }
-                        VirtualFree(intPtr2, UIntPtr.Zero, 32768u);
-                    }
-                }
-                return VirtualAlloc(IntPtr.Zero, (UIntPtr)(ulong)size, 12288u, 64u);
-            }
-            long num9 = nearAddr.ToInt64();
-            long num10 = 4096L;
-            long num11 = (size + 4095) & -4096;
-            long num12 = num9 - 2147418112;
-            if (num12 < 0)
-            {
-                num12 = 65536L;
-            }
-            long num13 = num9 + 2147418112;
-            for (long num14 = 0L; num14 < 2147418112; num14 += num10)
-            {
-                long num15 = num9 + num14;
-                if (num15 >= num12 && num15 + num11 <= num13)
-                {
-                    IntPtr intPtr3 = mmap(new IntPtr(num15), (UIntPtr)(ulong)num11, 7, 50, -1, 0L);
-                    if (intPtr3.ToInt64() != -1 && intPtr3 != IntPtr.Zero)
-                    {
-                        long num16 = intPtr3.ToInt64() - num9;
-                        if (num16 >= -2147483647 && num16 <= int.MaxValue)
-                        {
-                            return intPtr3;
-                        }
-                        munmap(intPtr3, (UIntPtr)(ulong)num11);
-                    }
-                }
-                if (num14 <= 0)
-                {
-                    continue;
-                }
-                num15 = num9 - num14;
-                if (num15 < num12 || num15 + num11 > num13)
-                {
-                    continue;
-                }
-                IntPtr intPtr4 = mmap(new IntPtr(num15), (UIntPtr)(ulong)num11, 7, 50, -1, 0L);
-                if (intPtr4.ToInt64() != -1 && intPtr4 != IntPtr.Zero)
-                {
-                    long num17 = intPtr4.ToInt64() - num9;
-                    if (num17 >= -2147483647 && num17 <= int.MaxValue)
-                    {
-                        return intPtr4;
-                    }
-                    munmap(intPtr4, (UIntPtr)(ulong)num11);
-                }
-            }
-            return AllocExec(size);
-        }
-
-        public static void FreeExec(IntPtr ptr, int size)
-        {
-            if (!(ptr == IntPtr.Zero))
-            {
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    VirtualFree(ptr, UIntPtr.Zero, 32768u);
-                }
-                else
-                {
-                    munmap(ptr, (UIntPtr)(ulong)size);
-                }
-            }
-        }
-
-        private struct MEMORY_BASIC_INFORMATION
-        {
-            public IntPtr BaseAddress;
-            public IntPtr AllocationBase;
-            public uint AllocationProtect;
-            public UIntPtr RegionSize;
-            public uint State;
-            public uint Protect;
-            public uint Type;
-        }
-
-        /// <summary>
-        /// Checks whether the memory at the given address is committed and readable.
-        /// Prevents AccessViolationException (uncatchable in .NET 8) when scanning
-        /// MethodDesc/MethodTable regions that may extend into unmapped memory.
-        /// </summary>
-        public static bool IsReadable(IntPtr addr, int size)
-        {
-            if (addr == IntPtr.Zero)
-            {
-                return false;
-            }
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                MEMORY_BASIC_INFORMATION mbi;
-                IntPtr ret = VirtualQuery(addr, out mbi, (UIntPtr)System.Runtime.InteropServices.Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION)));
-                if (ret == IntPtr.Zero)
-                {
-                    return false;
-                }
-                // State == MEM_COMMIT (0x1000) and readable protection flags
-                if (mbi.State != 0x1000)
-                {
-                    return false;
-                }
-                // Check the region covers the requested size
-                long regionEnd = mbi.BaseAddress.ToInt64() + (long)mbi.RegionSize.ToUInt64();
-                long readEnd = addr.ToInt64() + size;
-                if (readEnd > regionEnd)
-                {
-                    return false;
-                }
-                // Protection must allow read: PAGE_READONLY(2), PAGE_READWRITE(4),
-                // PAGE_WRITECOPY(8), PAGE_EXECUTE_READ(0x20), PAGE_EXECUTE_READWRITE(0x40),
-                // PAGE_EXECUTE_WRITECOPY(0x80)
-                uint p = mbi.Protect & 0xFF;
-                return p == 2 || p == 4 || p == 8 || p == 0x20 || p == 0x40 || p == 0x80;
-            }
-            // Non-Windows: assume readable (mmap'd pages are readable until munmap'd)
-            return true;
-        }
-
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr VirtualProtect(IntPtr addr, UIntPtr size, uint prot, out uint old);
-
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size, uint type, uint prot);
-
-        [DllImport("kernel32.dll")]
-        private static extern bool VirtualFree(IntPtr addr, UIntPtr size, uint type);
-
-        [DllImport("kernel32.dll")]
-        private static extern void FlushInstructionCache(IntPtr hProcess, IntPtr lpBaseAddress, UIntPtr dwSize);
-
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr VirtualQuery(IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, UIntPtr dwLength);
-
-        [DllImport("libc", SetLastError = true)]
-        private static extern int mprotect(IntPtr addr, UIntPtr len, int prot);
-
-        [DllImport("libc", SetLastError = true)]
-        private static extern IntPtr mmap(IntPtr addr, UIntPtr len, int prot, int flags, int fd, long off);
-
-        [DllImport("libc", SetLastError = true)]
-        private static extern int munmap(IntPtr addr, UIntPtr len);
-    }
-    internal static class Jumper
-    {
-        public static byte[] BuildJump(IntPtr fromAddr, IntPtr toAddr)
-        {
-            return Platform.Current switch
-            {
-                Platform.Arch.X64 => JumpX64(toAddr),
-                Platform.Arch.X86 => JumpX86(fromAddr, toAddr),
-                Platform.Arch.ARM64 => JumpARM64(toAddr),
-                Platform.Arch.ARM32 => JumpARM32(toAddr),
-                _ => JumpX64(toAddr),
-            };
-        }
-
-        public static byte[] Install(IntPtr target, IntPtr replacement)
-        {
-            byte[] array = BuildJump(target, replacement);
-            byte[] array2 = new byte[array.Length];
-            Marshal.Copy(target, array2, 0, array.Length);
-            Memory.ProtectWritable(target, array.Length);
-            Marshal.Copy(array, 0, target, array.Length);
-            Memory.ProtectExecutable(target, array.Length);
-            return array2;
-        }
-
-        public static void WriteJump(IntPtr target, IntPtr replacement)
-        {
-            byte[] array = BuildJump(target, replacement);
-            Memory.ProtectWritable(target, array.Length);
-            Marshal.Copy(array, 0, target, array.Length);
-            Memory.ProtectExecutable(target, array.Length);
-        }
-
-        public static void Restore(IntPtr target, byte[] original)
-        {
-            Memory.ProtectWritable(target, original.Length);
-            Marshal.Copy(original, 0, target, original.Length);
-            Memory.ProtectExecutable(target, original.Length);
-        }
-
-        private static byte[] JumpX64(IntPtr to)
-        {
-            byte[] array = new byte[12]
-            {
-            72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0
-            };
-            BitConverter.GetBytes(to.ToInt64()).CopyTo(array, 2);
-            array[10] = byte.MaxValue;
-            array[11] = 224;
-            return array;
-        }
-
-        private static byte[] JumpX86(IntPtr from, IntPtr to)
-        {
-            byte[] array = new byte[5] { 233, 0, 0, 0, 0 };
-            BitConverter.GetBytes(to.ToInt32() - (from.ToInt32() + 5)).CopyTo(array, 1);
-            return array;
-        }
-
-        private static byte[] JumpARM64(IntPtr to)
-        {
-            byte[] array = new byte[16]
-            {
-            80, 0, 0, 88, 0, 2, 31, 214, 0, 0,
-            0, 0, 0, 0, 0, 0
-            };
-            BitConverter.GetBytes(to.ToInt64()).CopyTo(array, 8);
-            return array;
-        }
-
-        private static byte[] JumpARM32(IntPtr to)
-        {
-            byte[] array = new byte[12]
-            {
-            4, 192, 159, 229, 28, 240, 47, 225, 0, 0,
-            0, 0
-            };
-            BitConverter.GetBytes(to.ToInt32()).CopyTo(array, 8);
-            return array;
-        }
-    }
-    internal static class MethodEntryResolver
-    {
-        public static IntPtr ResolveRealEntry(IntPtr ptr)
-        {
-            if (ptr == IntPtr.Zero)
-            {
-                return IntPtr.Zero;
-            }
-            Platform.Arch current = Platform.Current;
-            IntPtr intPtr = ptr;
-            for (int i = 0; i < 10; i++)
-            {
-                IntPtr intPtr2;
-                try
-                {
-                    switch (current)
-                    {
-                        case Platform.Arch.X64:
-                            intPtr2 = ResolveOneX64(intPtr);
-                            break;
-                        case Platform.Arch.X86:
-                            intPtr2 = ResolveOneX86(intPtr);
-                            break;
-                        default:
-                            return intPtr;
-                    }
-                }
-                catch
-                {
-                    return intPtr;
-                }
-                if (intPtr2 == intPtr || intPtr2 == IntPtr.Zero)
-                {
-                    return intPtr;
-                }
-                intPtr = intPtr2;
-            }
-            return intPtr;
-        }
-
-        public static bool IsJump(IntPtr ptr)
-        {
-            if (ptr == IntPtr.Zero)
-            {
-                return false;
-            }
-            try
-            {
-                return Platform.Current switch
-                {
-                    Platform.Arch.X64 => IsJumpX64(ptr),
-                    Platform.Arch.X86 => IsJumpX86(ptr),
-                    _ => false,
-                };
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private unsafe static bool IsJumpX64(IntPtr ptr)
-        {
-            if (!Memory.IsReadable(ptr, 12)) return false;
-            byte* ptr2 = (byte*)(void*)ptr;
-            byte b = *ptr2;
-            byte b2 = ptr2[1];
-            if (b == byte.MaxValue && b2 == 37)
-            {
-                return true;
-            }
-            switch (b)
-            {
-                case 233:
-                    return true;
-                case 72:
-                    if (b2 == 184 && ptr2[10] == byte.MaxValue && ptr2[11] == 224)
-                    {
-                        return true;
-                    }
-                    break;
-            }
-            switch (b)
-            {
-                case 232:
-                    return true;
-                case 76:
-                    if (b2 == 141)
-                    {
-                        return true;
-                    }
-                    break;
-            }
-            if (b == 76 && b2 == 139 && ptr2[2] == 21)
-            {
-                return true;
-            }
-            if (b == 76 && b2 == 139 && ptr2[2] == 208)
-            {
-                return true;
-            }
-            if (b == 72 && b2 == 137 && ptr2[2] == 242)
-            {
-                return true;
-            }
-            return false;
-        }
-
-        private unsafe static bool IsJumpX86(IntPtr ptr)
-        {
-            if (!Memory.IsReadable(ptr, 6)) return false;
-            byte* ptr2 = (byte*)(void*)ptr;
-            byte b = *ptr2;
-            byte b2 = ptr2[1];
-            if (b == byte.MaxValue && b2 == 37)
-            {
-                return true;
-            }
-            return b switch
-            {
-                233 => true,
-                232 => true,
-                _ => false,
-            };
-        }
-
-        private unsafe static IntPtr ResolveOneX64(IntPtr ptr)
-        {
-            // .NET 6+ does NOT allow catching AccessViolationException from
-            // unmapped memory reads — the process is terminated. Always check
-            // readability before dereferencing.
-            if (!Memory.IsReadable(ptr, 64))
-            {
-                return ptr;
-            }
-            byte* ptr2 = (byte*)(void*)ptr;
-            byte b = *ptr2;
-            byte b2 = ptr2[1];
-            if (b == byte.MaxValue && b2 == 37)
-            {
-                int num = *(int*)(ptr2 + 2);
-                long num2 = ptr.ToInt64() + 6 + num;
-                if (!Memory.IsReadable(new IntPtr(num2), 8))
-                {
-                    return ptr;
-                }
-                long value = *(long*)num2;
-                return new IntPtr(value);
-            }
-            switch (b)
-            {
-                case 233:
-                    {
-                        int num3 = *(int*)(ptr2 + 1);
-                        return new IntPtr(ptr.ToInt64() + 5 + num3);
-                    }
-                case 72:
-                    if (b2 == 184 && ptr2[10] == byte.MaxValue && ptr2[11] == 224)
-                    {
-                        long value2 = *(long*)(ptr2 + 2);
-                        return new IntPtr(value2);
-                    }
-                    break;
-            }
-            if (b == 76 && b2 == 141)
-            {
-                byte* ptr3 = ptr2 + 7;
-                if (*ptr3 == byte.MaxValue && ptr3[1] == 37)
-                {
-                    int num4 = *(int*)(ptr3 + 2);
-                    long num5 = (long)ptr3 + 6L + num4;
-                    if (!Memory.IsReadable(new IntPtr(num5), 8))
-                    {
-                        return ptr;
-                    }
-                    long value3 = *(long*)num5;
-                    return new IntPtr(value3);
-                }
-            }
-            if (b == 232 && ptr2[5] == 94)
-            {
-                return ptr;
-            }
-            if (b == 76 && b2 == 139 && ptr2[2] == 21)
-            {
-                byte* ptr4 = ptr2 + 7;
-                if (*ptr4 == byte.MaxValue && ptr4[1] == 37)
-                {
-                    int num6 = *(int*)(ptr4 + 2);
-                    long num7 = (long)ptr4 + 6L + num6;
-                    if (!Memory.IsReadable(new IntPtr(num7), 8))
-                    {
-                        return ptr;
-                    }
-                    long value4 = *(long*)num7;
-                    return new IntPtr(value4);
-                }
-            }
-            for (int i = 0; i <= 24; i++)
-            {
-                if (ptr2[i] == 72 && ptr2[i + 1] == 184 && i + 11 < 64 && ptr2[i + 10] == byte.MaxValue && ptr2[i + 11] == 224)
-                {
-                    long value5 = *(long*)(ptr2 + i + 2);
-                    return new IntPtr(value5);
-                }
-            }
-            return ptr;
-        }
-
-        private unsafe static IntPtr ResolveOneX86(IntPtr ptr)
-        {
-            if (!Memory.IsReadable(ptr, 20))
-            {
-                return ptr;
-            }
-            byte* ptr2 = (byte*)(void*)ptr;
-            byte b = *ptr2;
-            byte b2 = ptr2[1];
-            if (b == byte.MaxValue && b2 == 37)
-            {
-                int num = *(int*)(ptr2 + 2);
-                if (!Memory.IsReadable(new IntPtr(num), 4))
-                {
-                    return ptr;
-                }
-                int value = *(int*)num;
-                return new IntPtr(value);
-            }
-            if (b == 233)
-            {
-                int num2 = *(int*)(ptr2 + 1);
-                return new IntPtr(ptr.ToInt32() + 5 + num2);
-            }
-            // B8 precode (.NET Framework 4.x x86 fixup precode):
-            //   B8 <MethodDesc> [90] E8 <rel32> E9 <rel32>
-            // The E9 (JMP rel32) at offset 10 or 11 is the backpatched jump to
-            // the real JIT code. Follow it so callers reach the JIT entry point.
-            if (b == 0xB8)
-            {
-                for (int i = 5; i <= 15; i++)
-                {
-                    if (ptr2[i] == 0xE9)
-                    {
-                        int rel = *(int*)(ptr2 + i + 1);
-                        return new IntPtr(ptr.ToInt32() + i + 5 + rel);
-                    }
-                }
-            }
-            // E8 precode: treat as sentinel (don't follow). The caller
-            // (InstallSecondaryJitPatchX86) handles E8 manually.
-            return ptr;
-        }
-    }
-    internal static class SlotPatcher
-    {
-        public static List<IntPtr> FindSlots(IntPtr methodDesc, IntPtr methodTable, IntPtr value)
-        {
-            List<IntPtr> list = new List<IntPtr>();
-            int size = IntPtr.Size;
-            long num = value.ToInt64();
-            long num2 = MethodEntryResolver.ResolveRealEntry(value).ToInt64();
-            if (methodDesc != IntPtr.Zero)
-            {
-                for (int i = 0; i < 128; i += size)
-                {
-                    if (!Memory.IsReadable(methodDesc + i, size))
-                    {
-                        break;
-                    }
-                    try
-                    {
-                        long num3 = ReadPointer(methodDesc + i);
-                        if (num3 == num || num3 == num2)
-                        {
-                            list.Add(methodDesc + i);
-                        }
-                    }
-                    catch
-                    {
-                        break;
-                    }
-                }
-            }
-            if (methodTable != IntPtr.Zero)
-            {
-                int consecutiveUnreadable = 0;
-                for (int j = 0; j < 65536; j += size)
-                {
-                    if (!Memory.IsReadable(methodTable + j, size))
-                    {
-                        // Skip unreadable regions instead of breaking. The MethodTable
-                        // may span non-contiguous pages (e.g. on x86 where the vtable
-                        // extends past a page boundary). Allow up to 4096 bytes of
-                        // consecutive unreadable memory before giving up.
-                        consecutiveUnreadable += size;
-                        if (consecutiveUnreadable >= 4096)
-                            break;
-                        continue;
-                    }
-                    consecutiveUnreadable = 0;
-                    try
-                    {
-                        long num4 = ReadPointer(methodTable + j);
-                        if (num4 == num || num4 == num2)
-                        {
-                            list.Add(methodTable + j);
-                        }
-                    }
-                    catch
-                    {
-                        break;
-                    }
-                }
-            }
-            return list;
-        }
-
-        public static void ReplaceSlot(IntPtr slot, IntPtr newValue)
-        {
-            int size = IntPtr.Size;
-            Memory.ProtectReadWrite(slot, size);
-            WritePointer(slot, newValue.ToInt64());
-        }
-
-        private static long ReadPointer(IntPtr addr)
-        {
-            if (IntPtr.Size == 8)
-            {
-                return Marshal.ReadInt64(addr);
-            }
-            return Marshal.ReadInt32(addr);
-        }
-
-        private static void WritePointer(IntPtr addr, long value)
-        {
-            if (IntPtr.Size == 8)
-            {
-                Marshal.WriteInt64(addr, value);
-            }
-            else
-            {
-                Marshal.WriteInt32(addr, (int)value);
-            }
-        }
-    }
-    internal static class GenericAdapter
-    {
-        public static IntPtr Create(IntPtr hookEntry, MethodBase targetMethod, IntPtr nearAddr)
-        {
-            Platform.Arch current = Platform.Current;
-            if (current != Platform.Arch.X64)
-            {
-                return hookEntry;
-            }
-            bool isStatic = targetMethod.IsStatic;
-            int userParamCount = targetMethod.GetParameters().Length;
-            bool flag = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) || RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
-            List<byte> list = new List<byte>();
-            if (flag)
-            {
-                BuildSystemVAdapter(list, isStatic, userParamCount);
-            }
-            else
-            {
-                BuildWindowsX64Adapter(list, isStatic, userParamCount);
-            }
-            list.Add(72);
-            list.Add(184);
-            list.AddRange(BitConverter.GetBytes(hookEntry.ToInt64()));
-            list.Add(byte.MaxValue);
-            list.Add(224);
-            IntPtr intPtr = Memory.AllocExecNear(nearAddr, list.Count);
-            if (intPtr == IntPtr.Zero || intPtr == new IntPtr(-1))
-            {
-                return IntPtr.Zero;
-            }
-            Marshal.Copy(list.ToArray(), 0, intPtr, list.Count);
-            Memory.ProtectExecutable(intPtr, list.Count);
-            return intPtr;
-        }
-
-        private static void BuildWindowsX64Adapter(List<byte> code, bool isStatic, int userParamCount)
-        {
-            int num = ((!isStatic) ? 1 : 0);
-            int num2 = (isStatic ? 1 : 2) + userParamCount;
-            int num3 = Math.Min(num2 - 2, 3);
-            for (int i = num; i <= num3; i++)
-            {
-                int num4 = i + 1;
-                if (num4 < 4)
-                {
-                    EmitMovRegReg(code, i, num4);
-                    continue;
-                }
-                int offset = 32 + (num4 - 3) * 8;
-                EmitMovRegFromStack(code, i, offset);
-            }
-            if (num2 > 4)
-            {
-                int num5 = num2 - 5;
-                for (int j = 0; j < num5; j++)
-                {
-                    int value = 40 + j * 8;
-                    int value2 = 48 + j * 8;
-                    code.Add(72);
-                    code.Add(139);
-                    code.Add(132);
-                    code.Add(36);
-                    code.AddRange(BitConverter.GetBytes(value2));
-                    code.Add(72);
-                    code.Add(137);
-                    code.Add(132);
-                    code.Add(36);
-                    code.AddRange(BitConverter.GetBytes(value));
-                }
-            }
-            int num6 = Math.Min(num2 - 1, 4);
-            for (int num7 = Math.Min(3, num6 - 1); num7 >= 0; num7--)
-            {
-                int offset2 = 8 + num7 * 8;
-                EmitMovShadowFromReg(code, num7, offset2);
-            }
-        }
-
-        private static void EmitMovRegReg(List<byte> code, int dst, int src)
-        {
-            byte b = 72;
-            if (src >= 2)
-            {
-                b |= 0x44;
-            }
-            if (dst >= 2)
-            {
-                b |= 1;
-            }
-            code.Add(b);
-            code.Add(137);
-            int num = src & 3;
-            int num2 = dst & 3;
-            code.Add((byte)(0xC0 | (num << 3) | num2));
-        }
-
-        private static void EmitMovRegFromStack(List<byte> code, int reg, int offset)
-        {
-            byte b = 72;
-            if (reg >= 2)
-            {
-                b |= 1;
-            }
-            code.Add(b);
-            code.Add(139);
-            int num = reg & 3;
-            code.Add((byte)(4 | (num << 3)));
-            code.Add(36);
-            code.Add((byte)offset);
-        }
-
-        private static void EmitMovShadowFromReg(List<byte> code, int reg, int offset)
-        {
-            byte b = 72;
-            if (reg >= 2)
-            {
-                b |= 0x44;
-            }
-            code.Add(b);
-            code.Add(137);
-            int num = reg & 3;
-            code.Add((byte)(0x44 | (num << 3)));
-            code.Add(36);
-            code.Add((byte)offset);
-        }
-
-        private static void BuildSystemVAdapter(List<byte> code, bool isStatic, int userParamCount)
-        {
-            int num = ((!isStatic) ? 1 : 0);
-            int num2 = (isStatic ? 1 : 2) + userParamCount;
-            int num3 = Math.Min(num2 - 2, 5);
-            for (int i = num; i <= num3; i++)
-            {
-                int num4 = i + 1;
-                if (num4 < 6)
-                {
-                    EmitMovRegRegSystemV(code, i, num4);
-                    continue;
-                }
-                int offset = (num4 - 6) * 8;
-                EmitMovRegFromStackSystemV(code, i, offset);
-            }
-            if (num2 > 6)
-            {
-                int num5 = num2 - 7;
-                for (int j = 0; j < num5; j++)
-                {
-                    int value = j * 8;
-                    int value2 = (j + 1) * 8;
-                    code.Add(72);
-                    code.Add(139);
-                    code.Add(132);
-                    code.Add(36);
-                    code.AddRange(BitConverter.GetBytes(value2));
-                    code.Add(72);
-                    code.Add(137);
-                    code.Add(132);
-                    code.Add(36);
-                    code.AddRange(BitConverter.GetBytes(value));
-                }
-            }
-        }
-
-        private static void EmitMovRegRegSystemV(List<byte> code, int dst, int src)
-        {
-            byte b = 72;
-            if (src >= 4)
-            {
-                b |= 0x44;
-            }
-            if (dst >= 4)
-            {
-                b |= 1;
-            }
-            code.Add(b);
-            code.Add(137);
-            int num = src & 3;
-            int num2 = dst & 3;
-            code.Add((byte)(0xC0 | (num << 3) | num2));
-        }
-
-        private static void EmitMovRegFromStackSystemV(List<byte> code, int reg, int offset)
-        {
-            byte b = 72;
-            if (reg >= 4)
-            {
-                b |= 1;
-            }
-            code.Add(b);
-            code.Add(139);
-            int num = reg & 3;
-            code.Add((byte)(4 | (num << 3)));
-            code.Add(36);
-            code.Add((byte)offset);
-        }
-    }
-
-    /// <summary>
-    /// Minimal x86-64 instruction length decoder. Handles common prologue instructions
-    /// to determine how many bytes of complete instructions must be relocated to a
-    /// call-original trampoline. Returns 0 on any instruction it cannot safely decode
-    /// (including RIP-relative and relative-jump instructions, which cannot be blindly
-    /// copied to a different address without relocation).
-    /// </summary>
-    internal static class X64Decoder
-    {
-        /// <summary>
-        /// Accumulates complete x86-64 instruction lengths starting at <paramref name="code"/>
-        /// until the total is at least <paramref name="minBytes"/>. Returns 0 if decoding
-        /// fails or a non-relocatable instruction is encountered.
-        /// </summary>
-        public unsafe static int CopyCompleteInstructions(byte* code, int minBytes, int maxBytes)
-        {
-            int total = 0;
-            while (total < minBytes)
-            {
-                if (total >= maxBytes) return 0;
-                int len = InstructionLength(code + total, maxBytes - total);
-                if (len <= 0) return 0;
-                total += len;
-            }
-            return total;
-        }
-
-        private unsafe static int InstructionLength(byte* code, int maxLen)
-        {
-            if (maxLen < 1) return 0;
-            int pos = 0;
-
-            // Legacy prefixes
-            while (pos < maxLen)
-            {
-                byte b = code[pos];
-                if (b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-                    b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65 ||
-                    b == 0x66 || b == 0x67)
-                {
-                    pos++;
-                    if (pos >= maxLen) return 0;
-                }
-                else break;
-            }
-
-            // REX prefix
-            bool rexW = false;
-            if (pos < maxLen && code[pos] >= 0x40 && code[pos] <= 0x4F)
-            {
-                rexW = (code[pos] & 0x08) != 0;
-                pos++;
-                if (pos >= maxLen) return 0;
-            }
-
-            byte opcode = code[pos++];
-
-            // 0x50-0x5F: push/pop r64 (1 byte)
-            if (opcode >= 0x50 && opcode <= 0x5F) return pos;
-            // 0x90: nop
-            if (opcode == 0x90) return pos;
-            // 0xC3: ret, 0xCC: int3, 0x9C: pushfq, 0x9D: popfq
-            if (opcode == 0xC3 || opcode == 0xCC || opcode == 0x9C || opcode == 0x9D) return pos;
-
-            // 0xB8-0xBF: mov r64, imm64 (with REX.W) or mov r32, imm32
-            if (opcode >= 0xB8 && opcode <= 0xBF) return pos + (rexW ? 8 : 4);
-            // 0xB0-0xB7: mov r8, imm8
-            if (opcode >= 0xB0 && opcode <= 0xB7) return pos + 1;
-
-            // 0x68: push imm32, 0x6A: push imm8
-            if (opcode == 0x68) return pos + 4;
-            if (opcode == 0x6A) return pos + 1;
-
-            // Relative jumps/calls — NOT relocatable, fail
-            if (opcode == 0xE8 || opcode == 0xE9) return 0; // call/jmp rel32
-            if (opcode == 0xEB) return 0; // jmp rel8
-            if (opcode >= 0x70 && opcode <= 0x7F) return 0; // jcc rel8
-            if (opcode >= 0xE0 && opcode <= 0xE3) return 0; // loop/jcxz
-
-            // 0x0F: two-byte opcode
-            if (opcode == 0x0F)
-            {
-                if (pos >= maxLen) return 0;
-                byte op2 = code[pos++];
-                // 0F 80-8F: jcc rel32 — NOT relocatable
-                if (op2 >= 0x80 && op2 <= 0x8F) return 0;
-                // Most other 0F xx have ModRM
-                int modrmLen = ModRMLength(code + pos, maxLen - pos);
-                if (modrmLen < 0) return 0;
-                return pos + modrmLen;
-            }
-
-            // Opcodes with ModRM + optional immediate
-            bool hasModRM = false;
-            int immLen = 0;
-
-            // Arithmetic group 0x00-0x3F
-            if (opcode <= 0x3D)
-            {
-                int low3 = opcode & 0x07;
-                if (low3 == 0x04) return pos + 1; // imm8 (e.g. add al, imm8)
-                if (low3 == 0x05) return pos + 4; // imm32 (e.g. add eax, imm32)
-                if (low3 <= 0x03) hasModRM = true;
-            }
-
-            switch (opcode)
-            {
-                case 0x81: hasModRM = true; immLen = 4; break;
-                case 0x83: hasModRM = true; immLen = 1; break;
-                case 0x69: hasModRM = true; immLen = 4; break;
-                case 0x6B: hasModRM = true; immLen = 1; break;
-                case 0xC1: hasModRM = true; immLen = 1; break;
-                case 0xC7: hasModRM = true; immLen = 4; break;
-                case 0x89:
-                case 0x8B:
-                case 0x8D:
-                case 0xFF:
-                case 0x85:
-                case 0x63:
-                case 0x03:
-                case 0x0B:
-                case 0x13:
-                case 0x1B:
-                case 0x23:
-                case 0x2B:
-                case 0x33:
-                case 0x3B:
-                case 0xD1:
-                case 0xD3:
-                case 0xF6:
-                case 0xF7:
-                case 0x86:
-                case 0x87:
-                case 0x88:
-                case 0x8A:
-                case 0x00:
-                case 0x01:
-                case 0x08:
-                case 0x09:
-                case 0x10:
-                case 0x11:
-                case 0x18:
-                case 0x19:
-                case 0x20:
-                case 0x21:
-                case 0x28:
-                case 0x29:
-                case 0x30:
-                case 0x31:
-                case 0x38:
-                case 0x39:
-                case 0x62:
-                    hasModRM = true; break;
-                default:
-                    return 0; // unknown opcode
-            }
-
-            if (!hasModRM) return 0;
-
-            int mrmLen = ModRMLength(code + pos, maxLen - pos);
-            if (mrmLen < 0) return 0;
-            pos += mrmLen;
-
-            return pos + immLen;
-        }
-
-        /// <summary>
-        /// Decodes ModRM byte + optional SIB + optional displacement.
-        /// Returns total length (including ModRM byte), or -1 on failure.
-        /// Returns -1 for RIP-relative addressing (mod=00, rm=101) since it is
-        /// not safely relocatable.
-        /// </summary>
-        private unsafe static int ModRMLength(byte* p, int maxLen)
-        {
-            if (maxLen < 1) return -1;
-            byte modrm = p[0];
-            int mod = (modrm >> 6) & 0x03;
-            int rm = modrm & 0x07;
-            int len = 1;
-
-            if (mod == 0x03) return len; // register operand
-
-            if (rm == 0x04) // SIB byte follows
-            {
-                if (len >= maxLen) return -1;
-                byte sib = p[len];
-                len++;
-                int base_ = sib & 0x07;
-                if (mod == 0x00 && base_ == 0x05) len += 4;      // disp32
-                else if (mod == 0x01) len += 1;                    // disp8
-                else if (mod == 0x02) len += 4;                    // disp32
-            }
-            else if (rm == 0x05 && mod == 0x00)
-            {
-                return -1; // RIP-relative — not relocatable
-            }
-            else if (mod == 0x01) len += 1;  // disp8
-            else if (mod == 0x02) len += 4;  // disp32
-
-            if (len > maxLen) return -1;
-            return len;
-        }
-    }
-
     public sealed class MethodHook : IDisposable
     {
-        private class OverridePatch
-        {
-            public IntPtr Entry;
-
-            public byte[] OriginalBytes;
-
-            public List<IntPtr> Slots;
-        }
-
         private readonly MethodBase _targetMethod;
 
         private readonly MethodBase _hookMethod;
@@ -1178,20 +31,6 @@ namespace DynamicHook
         private IntPtr _indirectTargetLoc;
 
         private IntPtr _originalIndirectTarget;
-
-        /// <summary>
-        /// For generic FixupPrecode: the first FF 25's indirect target location and
-        /// original value. After PrepareMethod, the first FF 25 points directly to JIT
-        /// code, bypassing the second FF 25 (where _indirectTargetLoc is patched).
-        /// We redirect the first FF 25 to offset 6 (the MOV R10 instruction) so calls
-        /// flow through: first FF 25 -> offset 6 (MOV R10) -> second FF 25 -> hook.
-        /// This avoids patching JIT code entirely.
-        /// </summary>
-        private IntPtr _firstIndirectLoc;
-
-        private IntPtr _originalFirstIndirect;
-
-        private bool _hasFirstIndirectPatch;
 
         private IntPtr _nearTrampoline;
 
@@ -1232,15 +71,6 @@ namespace DynamicHook
 
         private int _callOrigTrampSize;
 
-        /// <summary>
-        /// True when the call-original trampoline contains a copy of the original
-        /// JIT prologue (copy-prologue trampoline). When true, CallOriginal can
-        /// invoke the trampoline WITHOUT RestoreAll/ReapplyAll, because the
-        /// trampoline bypasses the E9 patch by executing the copied prologue and
-        /// jumping past the patched bytes.
-        /// </summary>
-        private bool _callOrigUseCopyPrologue;
-
         private IntPtr _precodeAddr;
 
         /// <summary>
@@ -1268,11 +98,7 @@ namespace DynamicHook
         /// </summary>
         private int _delegateFlatArgCount;
 
-        private IntPtr _genericAdapter;
-
         private bool _needsGenericAdapter;
-
-        private List<OverridePatch> _overridePatches;
 
         private bool _isInstalled;
 
@@ -1357,7 +183,7 @@ namespace DynamicHook
             {
                 try
                 {
-                    long cur = Marshal.ReadInt64(_indirectTargetLoc);
+                    long cur = MemOps.ReadInt64(_indirectTargetLoc);
                     long want = _newSlotValue.ToInt64();
                     long orig = _originalIndirectTarget.ToInt64();
                     sb.AppendLine($"PrecodeT1 cell @0x{_indirectTargetLoc.ToInt64():X16}: cur=0x{cur:X16} want=0x{want:X16} orig=0x{orig:X16} {(cur == want ? "OK" : "OVERWRITTEN")}");
@@ -1369,11 +195,11 @@ namespace DynamicHook
             {
                 try
                 {
-                    byte b0 = Marshal.ReadByte(_secondaryJitAddress);
-                    byte b1 = Marshal.ReadByte(_secondaryJitAddress + 1);
-                    byte b2 = Marshal.ReadByte(_secondaryJitAddress + 2);
-                    byte b3 = Marshal.ReadByte(_secondaryJitAddress + 3);
-                    byte b4 = Marshal.ReadByte(_secondaryJitAddress + 4);
+                    byte b0 = MemOps.ReadByte(_secondaryJitAddress);
+                    byte b1 = MemOps.ReadByte(_secondaryJitAddress + 1);
+                    byte b2 = MemOps.ReadByte(_secondaryJitAddress + 2);
+                    byte b3 = MemOps.ReadByte(_secondaryJitAddress + 3);
+                    byte b4 = MemOps.ReadByte(_secondaryJitAddress + 4);
                     bool isE9 = (b0 == 0xE9);
                     sb.AppendLine($"JIT E9 @0x{_secondaryJitAddress.ToInt64():X16}: {b0:X2} {b1:X2} {b2:X2} {b3:X2} {b4:X2} {(isE9 ? "OK" : "OVERWRITTEN")}");
                 }
@@ -1384,8 +210,8 @@ namespace DynamicHook
             {
                 try
                 {
-                    byte b0 = Marshal.ReadByte(_target1Address);
-                    byte b1 = Marshal.ReadByte(_target1Address + 1);
+                    byte b0 = MemOps.ReadByte(_target1Address);
+                    byte b1 = MemOps.ReadByte(_target1Address + 1);
                     bool ok = (b0 == 0x48 && b1 == 0xB8);
                     sb.AppendLine($"Target1 thunk @0x{_target1Address.ToInt64():X16}: {b0:X2} {b1:X2} {(ok ? "OK" : "OVERWRITTEN")}");
                 }
@@ -1396,8 +222,8 @@ namespace DynamicHook
             {
                 try
                 {
-                    byte b0 = Marshal.ReadByte(_innerCodeAddress);
-                    byte b1 = Marshal.ReadByte(_innerCodeAddress + 1);
+                    byte b0 = MemOps.ReadByte(_innerCodeAddress);
+                    byte b1 = MemOps.ReadByte(_innerCodeAddress + 1);
                     bool ok = (b0 == 0x48 && b1 == 0xB8);
                     sb.AppendLine($"InnerCode @0x{_innerCodeAddress.ToInt64():X16}: {b0:X2} {b1:X2} {(ok ? "OK" : "OVERWRITTEN")}");
                 }
@@ -1408,7 +234,7 @@ namespace DynamicHook
             {
                 try
                 {
-                    long cur = Marshal.ReadInt64(_target2Loc);
+                    long cur = MemOps.ReadInt64(_target2Loc);
                     long want = _newSlotValue.ToInt64();
                     long orig = _target2OriginalValue.ToInt64();
                     sb.AppendLine($"Target2 cell @0x{_target2Loc.ToInt64():X16}: cur=0x{cur:X16} want=0x{want:X16} orig=0x{orig:X16} {(cur == want ? "OK" : "OVERWRITTEN")}");
@@ -1422,7 +248,7 @@ namespace DynamicHook
                 {
                     try
                     {
-                        long cur = Marshal.ReadInt64(slot);
+                        long cur = MemOps.ReadInt64(slot);
                         long want = _newSlotValue.ToInt64();
                         long orig = _originalSlotValue.ToInt64();
                         sb.AppendLine($"Slot @0x{slot.ToInt64():X16}: cur=0x{cur:X16} want=0x{want:X16} orig=0x{orig:X16} {(cur == want ? "OK" : (cur == orig ? "RESTORED" : "OTHER"))}");
@@ -1562,7 +388,7 @@ namespace DynamicHook
             IntPtr functionPointer = _targetMethod.MethodHandle.GetFunctionPointer();
             IntPtr functionPointer2 = _hookMethod.MethodHandle.GetFunctionPointer();
             hookDiagInfo.PrecodeAddr = functionPointer;
-            hookDiagInfo.PrecodeBytes = ReadBytesSafe(functionPointer, 32);
+            hookDiagInfo.PrecodeBytes = MemOps.ReadBytesSafe(functionPointer, 32);
             _originalSlotValue = functionPointer;
             if (_targetMethod is MethodInfo { IsGenericMethod: not false } methodInfo)
             {
@@ -1585,9 +411,6 @@ namespace DynamicHook
             {
                 // CoreCLR: generic dictionary is in R10 (loaded by precode/callsite).
                 // User args are already in correct registers (RCX=this, RDX=arg1, ...).
-                // The adapter's MOV RCX,R10 would overwrite 'this' with the generic dict.
-                // Skip adapter and jump directly to hook.
-                _genericAdapter = IntPtr.Zero;
                 hookDiagInfo.AdapterAddr = IntPtr.Zero;
                 hookDiagInfo.AdapterBytes = null;
             }
@@ -1834,7 +657,7 @@ namespace DynamicHook
                 _patchType = 3;
                 _patchAddress = targetPtr;
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, _originalBytes.Length);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, _originalBytes.Length);
             }
             catch (Exception ex)
             {
@@ -1850,7 +673,7 @@ namespace DynamicHook
                 diag.PatchError = "targetPtr not readable for x64 code patch";
                 return;
             }
-            byte* ptr = (byte*)(void*)targetPtr;
+            byte* ptr = (byte*)targetPtr;
             byte b = *ptr;
             byte b2 = ptr[1];
             if (b == byte.MaxValue && b2 == 37)
@@ -1875,8 +698,8 @@ namespace DynamicHook
                     }
                 }
                 // Dump bytes at target1 and MethodDesc for diagnostics
-                try { diag.Target1Bytes = ReadBytesSafe(diag.PrecodeFirstTargetAddr, 32); } catch { }
-                try { diag.MethodDescDump = ReadBytesSafe(_targetMethod.MethodHandle.Value, 64); } catch { }
+                try { diag.Target1Bytes = MemOps.ReadBytesSafe(diag.PrecodeFirstTargetAddr, 32); } catch { }
+                try { diag.MethodDescDump = MemOps.ReadBytesSafe(_targetMethod.MethodHandle.Value, 64); } catch { }
                 // For generic methods, call sites bypass the precode and call the JIT
                 // code directly. So we MUST patch the JIT code to redirect calls.
                 // We also patch the precode's target1 so that delegate.Invoke (which
@@ -1891,10 +714,9 @@ namespace DynamicHook
                     _patchAddress = targetPtr;
                     _indirectTargetLoc = new IntPtr(num3g);
                     _originalIndirectTarget = new IntPtr(*(long*)num3g);
-                    Memory.ProtectReadWrite(_indirectTargetLoc, 8);
-                    *(long*)num3g = jumpTarget.ToInt64();
+                    MemOps.WriteInt64Cell(_indirectTargetLoc, jumpTarget.ToInt64());
                     diag.PatchType = "Indirect(FF 25 1st) + JIT(E9, generic) + Target1(12-byte)";
-                    diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
                     // NOTE: InstallSecondaryJitPatch is intentionally NOT called here.
                     // Patching JIT code with a 5-byte E9 causes delegate invocation to
                     // hang on .NET 8. The precode + target1 + target2 patches are
@@ -1935,10 +757,9 @@ namespace DynamicHook
                     _patchAddress = targetPtr;
                     _indirectTargetLoc = new IntPtr(num3);
                     _originalIndirectTarget = new IntPtr(*(long*)num3);
-                    Memory.ProtectReadWrite(_indirectTargetLoc, 8);
-                    *(long*)num3 = jumpTarget.ToInt64();
+                    MemOps.WriteInt64Cell(_indirectTargetLoc, jumpTarget.ToInt64());
                     diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode)" : "Indirect(FF 25)");
-                    diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
                 }
             }
             else if (b == 232 || b == 233)
@@ -1958,28 +779,16 @@ namespace DynamicHook
                     diag.PatchError = "Failed to allocate near trampoline for E8/E9 patch";
                     return;
                 }
-                byte[] array = new byte[12]
-                {
-                72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0
-                };
-                BitConverter.GetBytes(jumpTarget.ToInt64()).CopyTo(array, 2);
-                array[10] = byte.MaxValue;
-                array[11] = 224;
-                Marshal.Copy(array, 0, _nearTrampoline, 12);
-                Memory.ProtectExecutable(_nearTrampoline, 12);
+                byte[] array = Jumper.BuildAbsJumpX64(jumpTarget);
+                MemOps.WriteBytes(_nearTrampoline, array);
                 _patchType = 2;
                 _patchAddress = targetPtr;
-                _originalBytes = new byte[6];
-                Marshal.Copy(targetPtr, _originalBytes, 0, 6);
+                _originalBytes = MemOps.ReadBytes(targetPtr, 6);
                 int value = (int)(_nearTrampoline.ToInt64() - (targetPtr.ToInt64() + 5));
-                byte[] array2 = new byte[5] { 233, 0, 0, 0, 0 };
-                BitConverter.GetBytes(value).CopyTo(array2, 1);
-                Memory.ProtectWritable(targetPtr, 5);
-                Marshal.Copy(array2, 0, targetPtr, 5);
-                Memory.ProtectExecutable(targetPtr, 5);
+                byte[] array2 = Jumper.BuildRelJump(targetPtr, _nearTrampoline);
+                MemOps.WriteBytesProtected(targetPtr, array2);
                 diag.PatchType = ((b == 232) ? "FixupPrecode(E8->E9)" : "DirectJump(E9)");
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else if (!MethodEntryResolver.IsJump(targetPtr))
             {
@@ -1987,7 +796,7 @@ namespace DynamicHook
                 _patchAddress = targetPtr;
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                 diag.PatchType = "JitCode(12-byte)";
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else
             {
@@ -1998,7 +807,7 @@ namespace DynamicHook
                     _patchAddress = intPtr;
                     _originalBytes = Jumper.Install(intPtr, jumpTarget);
                     diag.PatchType = "ResolvedJitCode(12-byte)";
-                    diag.InstalledBytes = ReadBytesSafe(intPtr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(intPtr, 16);
                 }
                 else
                 {
@@ -2021,7 +830,7 @@ namespace DynamicHook
                     {
                         if (!Memory.IsReadable(targetPtr, 6))
                         {
-                            diag.SlotError += "; targetPtr not readable for E8 check";
+                            diag.PatchError += "; targetPtr not readable for E8 check";
                             return;
                         }
                         byte* p = (byte*)targetPtr;
@@ -2036,7 +845,7 @@ namespace DynamicHook
                 }
                 if (intPtr == IntPtr.Zero || intPtr == targetPtr)
                 {
-                    diag.SlotError += "; cannot resolve JIT entry for secondary patch";
+                    diag.PatchError += "; cannot resolve JIT entry for secondary patch";
                     return;
                 }
                 // On .NET Framework 4.x, the resolved entry may be the "fixup code" that
@@ -2046,14 +855,14 @@ namespace DynamicHook
                 IntPtr realJit = TryResolveFixupToJitCode(intPtr);
                 if (realJit != IntPtr.Zero && realJit != intPtr)
                 {
-                    diag.SlotError += "; resolved fixup code -> real JIT at 0x" + realJit.ToInt64().ToString("X");
+                    diag.PatchError += "; resolved fixup code -> real JIT at 0x" + realJit.ToInt64().ToString("X");
                     intPtr = realJit;
                 }
                 InstallSecondaryJitPatchAt(intPtr, jumpTarget, diag);
             }
             catch (Exception ex)
             {
-                diag.SlotError = diag.SlotError + "; SecondaryJitPatch error: " + ex.Message;
+                diag.PatchError = diag.PatchError + "; SecondaryJitPatch error: " + ex.Message;
             }
         }
 
@@ -2126,11 +935,11 @@ namespace DynamicHook
             {
                 if (intPtr == IntPtr.Zero)
                 {
-                    diag.SlotError += "; cannot patch null JIT entry";
+                    diag.PatchError += "; cannot patch null JIT entry";
                     return;
                 }
                 diag.JitCodeAddr = intPtr;
-                diag.JitCodeOriginalBytes = ReadBytesSafe(intPtr, 32);
+                diag.JitCodeOriginalBytes = MemOps.ReadBytesSafe(intPtr, 32);
 
                 // Use a 5-byte relative jump (E9) with a near trampoline instead of a 12-byte
                 // absolute jump. This overwrites only 5 bytes of the prologue, minimizing GC
@@ -2138,40 +947,29 @@ namespace DynamicHook
                 IntPtr trampoline = Memory.AllocExecNear(intPtr, 12);
                 if (trampoline == IntPtr.Zero || trampoline == new IntPtr(-1))
                 {
-                    diag.SlotError += "; failed to allocate near trampoline for JIT patch";
+                    diag.PatchError += "; failed to allocate near trampoline for JIT patch";
                     return;
                 }
                 // Trampoline: MOV RAX, jumpTarget; JMP RAX (12 bytes)
-                byte[] trampBytes = new byte[12]
-                {
-                72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                byte.MaxValue, 224
-                };
-                BitConverter.GetBytes(jumpTarget.ToInt64()).CopyTo(trampBytes, 2);
-                Marshal.Copy(trampBytes, 0, trampoline, 12);
-                Memory.ProtectExecutable(trampoline, 12);
+                byte[] trampBytes = Jumper.BuildAbsJumpX64(jumpTarget);
+                MemOps.WriteBytes(trampoline, trampBytes);
 
                 // Patch JIT code with 5-byte relative jump to trampoline
                 _secondaryJitAddress = intPtr;
                 int patchSize = 5;
-                _secondaryJitOriginalBytes = new byte[patchSize];
-                Marshal.Copy(intPtr, _secondaryJitOriginalBytes, 0, patchSize);
-                int rel32 = (int)(trampoline.ToInt64() - (intPtr.ToInt64() + 5));
-                byte[] patch = new byte[5] { 233, 0, 0, 0, 0 };
-                BitConverter.GetBytes(rel32).CopyTo(patch, 1);
+                _secondaryJitOriginalBytes = MemOps.ReadBytes(intPtr, patchSize);
+                byte[] patch = Jumper.BuildRelJump(intPtr, trampoline);
                 // Build diagnostic string BEFORE patching to avoid triggering hook via String.Format
                 string diagMsg = "; SecondaryJitPatch(5-byte) at 0x" + intPtr.ToInt64().ToString("X") + " -> tramp 0x" + trampoline.ToInt64().ToString("X");
-                Memory.ProtectWritable(intPtr, 5);
-                Marshal.Copy(patch, 0, intPtr, 5);
-                Memory.ProtectExecutable(intPtr, 5);
+                MemOps.WriteBytesProtected(intPtr, patch);
                 _hasSecondaryPatch = true;
                 _secondaryTrampoline = trampoline;
-                diag.JitCodePatchedBytes = ReadBytesSafe(intPtr, 16);
-                diag.SlotError += diagMsg;
+                diag.JitCodePatchedBytes = MemOps.ReadBytesSafe(intPtr, 16);
+                diag.PatchError += diagMsg;
             }
             catch (Exception ex)
             {
-                diag.SlotError = diag.SlotError + "; SecondaryJitPatch error: " + ex.Message;
+                diag.PatchError = diag.PatchError + "; SecondaryJitPatch error: " + ex.Message;
             }
         }
 
@@ -2187,7 +985,7 @@ namespace DynamicHook
             {
                 if (!Memory.IsReadable(targetPtr, 6))
                 {
-                    diag.SlotError += "; targetPtr not readable for x86 secondary patch";
+                    diag.PatchError += "; targetPtr not readable for x86 secondary patch";
                     return;
                 }
                 byte* p = (byte*)targetPtr;
@@ -2201,7 +999,7 @@ namespace DynamicHook
 
                 if (fixupAddr == IntPtr.Zero)
                 {
-                    diag.SlotError += "; cannot resolve fixup code for x86 secondary patch";
+                    diag.PatchError += "; cannot resolve fixup code for x86 secondary patch";
                     return;
                 }
 
@@ -2243,31 +1041,26 @@ namespace DynamicHook
 
                 if (jitAddr == IntPtr.Zero)
                 {
-                    diag.SlotError += "; cannot resolve JIT entry for x86 secondary patch";
+                    diag.PatchError += "; cannot resolve JIT entry for x86 secondary patch";
                     return;
                 }
 
                 diag.JitCodeAddr = jitAddr;
-                diag.JitCodeOriginalBytes = ReadBytesSafe(jitAddr, 32);
+                diag.JitCodeOriginalBytes = MemOps.ReadBytesSafe(jitAddr, 32);
 
                 // Patch JIT code with 5-byte E9 relative jump (no trampoline needed on x86)
                 _secondaryJitAddress = jitAddr;
-                _secondaryJitOriginalBytes = new byte[5];
-                Marshal.Copy(jitAddr, _secondaryJitOriginalBytes, 0, 5);
-                int rel2 = jumpTarget.ToInt32() - (jitAddr.ToInt32() + 5);
-                byte[] patch = new byte[5] { 0xE9, 0, 0, 0, 0 };
-                BitConverter.GetBytes(rel2).CopyTo(patch, 1);
-                Memory.ProtectWritable(jitAddr, 5);
-                Marshal.Copy(patch, 0, jitAddr, 5);
-                Memory.ProtectExecutable(jitAddr, 5);
+                _secondaryJitOriginalBytes = MemOps.ReadBytes(jitAddr, 5);
+                byte[] patch = Jumper.BuildRelJump(jitAddr, jumpTarget);
+                MemOps.WriteBytesProtected(jitAddr, patch);
                 _hasSecondaryPatch = true;
                 _secondaryTrampoline = IntPtr.Zero; // no trampoline on x86
-                diag.JitCodePatchedBytes = ReadBytesSafe(jitAddr, 16);
-                diag.SlotError += "; SecondaryJitPatchX86(5-byte) at 0x" + jitAddr.ToInt32().ToString("X");
+                diag.JitCodePatchedBytes = MemOps.ReadBytesSafe(jitAddr, 16);
+                diag.PatchError += "; SecondaryJitPatchX86(5-byte) at 0x" + jitAddr.ToInt32().ToString("X");
             }
             catch (Exception ex)
             {
-                diag.SlotError = diag.SlotError + "; SecondaryJitPatchX86 error: " + ex.Message;
+                diag.PatchError = diag.PatchError + "; SecondaryJitPatchX86 error: " + ex.Message;
             }
         }
 
@@ -2291,7 +1084,7 @@ namespace DynamicHook
             try
             {
                 // Read the fixup code to extract the inner code address
-                byte[] fixupBytes = ReadBytesSafe(target1Addr, 25);
+                byte[] fixupBytes = MemOps.ReadBytesSafe(target1Addr, 25);
                 IntPtr innerCodeAddr = IntPtr.Zero;
                 if (fixupBytes != null && fixupBytes.Length >= 25 &&
                     fixupBytes[0] == 0x49 && fixupBytes[1] == 0x89 && fixupBytes[2] == 0xD0 &&
@@ -2322,64 +1115,48 @@ namespace DynamicHook
                 // Patch target1 (fixup thunk) with 12-byte absolute jump to hook
                 if (!Memory.IsReadable(target1Addr, 12))
                 {
-                    diag.SlotError += "; target1Addr not readable for patch";
+                    diag.PatchError += "; target1Addr not readable for patch";
                     return;
                 }
                 _target1Address = target1Addr;
-                _target1OriginalBytes = new byte[12];
-                Marshal.Copy(target1Addr, _target1OriginalBytes, 0, 12);
-                byte[] patch = new byte[12]
-                {
-                72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                byte.MaxValue, 224
-                };
-                BitConverter.GetBytes(jumpTarget.ToInt64()).CopyTo(patch, 2);
-                Memory.ProtectWritable(target1Addr, 12);
-                Marshal.Copy(patch, 0, target1Addr, 12);
-                Memory.ProtectExecutable(target1Addr, 12);
+                _target1OriginalBytes = MemOps.ReadBytes(target1Addr, 12);
+                byte[] patch = Jumper.BuildAbsJumpX64(jumpTarget);
+                MemOps.WriteBytesProtected(target1Addr, patch);
                 _hasTarget1Patch = true;
-                diag.SlotError += "; Target1Patch(12-byte) at 0x" + target1Addr.ToInt64().ToString("X");
+                diag.PatchError += "; Target1Patch(12-byte) at 0x" + target1Addr.ToInt64().ToString("X");
 
                 // Also patch the inner code address (the address the fixup code jumps to)
                 if (innerCodeAddr != IntPtr.Zero)
                 {
                     try
                     {
-                        byte[] innerBytes = ReadBytesSafe(innerCodeAddr, 16);
+                        byte[] innerBytes = MemOps.ReadBytesSafe(innerCodeAddr, 16);
                         // Only patch if it looks like code (not already patched)
                         if (innerBytes != null && innerBytes.Length >= 12 &&
                             (innerBytes[0] != 0x48 || innerBytes[1] != 0xB8))
                         {
                             _innerCodeAddress = innerCodeAddr;
-                            _innerCodeOriginalBytes = new byte[12];
-                            Marshal.Copy(innerCodeAddr, _innerCodeOriginalBytes, 0, 12);
+                            _innerCodeOriginalBytes = MemOps.ReadBytes(innerCodeAddr, 12);
                             // Save a larger copy for the call-original trampoline.
                             // Must be read BEFORE patching. The trampoline needs enough
                             // bytes to cover the 12-byte patch and reach an instruction
                             // boundary (which may be > 12 bytes).
-                            _innerCodeOriginalBytesFull = ReadBytesSafe(innerCodeAddr, 32);
-                            byte[] innerPatch = new byte[12]
-                            {
-                            72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                            byte.MaxValue, 224
-                            };
-                            BitConverter.GetBytes(jumpTarget.ToInt64()).CopyTo(innerPatch, 2);
-                            Memory.ProtectWritable(innerCodeAddr, 12);
-                            Marshal.Copy(innerPatch, 0, innerCodeAddr, 12);
-                            Memory.ProtectExecutable(innerCodeAddr, 12);
+                            _innerCodeOriginalBytesFull = MemOps.ReadBytesSafe(innerCodeAddr, 32);
+                            byte[] innerPatch = Jumper.BuildAbsJumpX64(jumpTarget);
+                            MemOps.WriteBytesProtected(innerCodeAddr, innerPatch);
                             _hasInnerCodePatch = true;
-                            diag.SlotError += "; InnerCodePatch(12-byte) at 0x" + innerCodeAddr.ToInt64().ToString("X");
+                            diag.PatchError += "; InnerCodePatch(12-byte) at 0x" + innerCodeAddr.ToInt64().ToString("X");
                         }
                     }
                     catch (Exception ex)
                     {
-                        diag.SlotError += "; InnerCodePatch error: " + ex.Message;
+                        diag.PatchError += "; InnerCodePatch error: " + ex.Message;
                     }
                 }
             }
             catch (Exception ex)
             {
-                diag.SlotError = diag.SlotError + "; Target1Patch error: " + ex.Message;
+                diag.PatchError = diag.PatchError + "; Target1Patch error: " + ex.Message;
             }
         }
 
@@ -2404,20 +1181,19 @@ namespace DynamicHook
                 IntPtr target2LocPtr = new IntPtr(target2Loc);
                 if (!Memory.IsReadable(target2LocPtr, 8))
                 {
-                    diag.SlotError += "; target2Loc not readable";
+                    diag.PatchError += "; target2Loc not readable";
                     return;
                 }
                 IntPtr originalTarget2 = new IntPtr(*(long*)target2Loc);
                 _target2Loc = target2LocPtr;
                 _target2OriginalValue = originalTarget2;
-                Memory.ProtectReadWrite(target2LocPtr, 8);
-                *(long*)target2Loc = jumpTarget.ToInt64();
+                MemOps.WriteInt64Cell(target2LocPtr, jumpTarget.ToInt64());
                 _hasTarget2Patch = true;
-                diag.SlotError += "; Target2Patch(data cell) at 0x" + target2LocPtr.ToInt64().ToString("X") + " orig=0x" + originalTarget2.ToInt64().ToString("X");
+                diag.PatchError += "; Target2Patch(data cell) at 0x" + target2LocPtr.ToInt64().ToString("X") + " orig=0x" + originalTarget2.ToInt64().ToString("X");
             }
             catch (Exception ex)
             {
-                diag.SlotError = diag.SlotError + "; Target2Patch error: " + ex.Message;
+                diag.PatchError = diag.PatchError + "; Target2Patch error: " + ex.Message;
             }
         }
 
@@ -2516,11 +1292,9 @@ namespace DynamicHook
                 trampBytes[offset + 10] = 0xFF;
                 trampBytes[offset + 11] = 0xE0;
 
-                Marshal.Copy(trampBytes, 0, tramp, trampSize);
-                Memory.ProtectExecutable(tramp, trampSize);
+                MemOps.WriteBytes(tramp, trampBytes);
 
                 _callOrigTrampoline = tramp;
-                _callOrigUseCopyPrologue = true;
                 diag.CallOrigStatus = "CopyPrologueTramp at 0x" + tramp.ToInt64().ToString("X") +
                     " (jitCode=0x" + jitCodeAddr.ToInt64().ToString("X") +
                     ", copyLen=" + copyLen +
@@ -2705,7 +1479,7 @@ namespace DynamicHook
                             {
                                 // RIP-relative: adjust disp32
                                 int oldDisp = BitConverter.ToInt32(code, modrmOff + 1);
-                                long adjustment = origAddr.ToInt64() + (offset - start) - newAddr.ToInt64() - (offset - start);
+                                long adjustment = origAddr.ToInt64() - newAddr.ToInt64();
                                 int newDisp = (int)(oldDisp + adjustment);
                                 BitConverter.GetBytes(newDisp).CopyTo(code, modrmOff + 1);
                             }
@@ -2737,7 +1511,7 @@ namespace DynamicHook
             if (!Memory.IsReadable(new IntPtr(dictAddr), IntPtr.Size)) return IntPtr.Zero;
             try
             {
-                return Marshal.ReadIntPtr(new IntPtr(dictAddr));
+                return MemOps.ReadIntPtr(new IntPtr(dictAddr));
             }
             catch
             {
@@ -2763,10 +1537,10 @@ namespace DynamicHook
         {
             if (!Memory.IsReadable(targetPtr, 20))
             {
-                diag.SlotError += "; targetPtr not readable for x86 code patch";
+                diag.PatchError += "; targetPtr not readable for x86 code patch";
                 return;
             }
-            byte* ptr = (byte*)(void*)targetPtr;
+            byte* ptr = (byte*)targetPtr;
             byte b = *ptr;
             byte b2 = ptr[1];
             if (b == byte.MaxValue && b2 == 37)
@@ -2776,10 +1550,9 @@ namespace DynamicHook
                 _patchAddress = targetPtr;
                 _indirectTargetLoc = new IntPtr(num);
                 _originalIndirectTarget = new IntPtr(*(int*)num);
-                Memory.ProtectReadWrite(_indirectTargetLoc, 4);
-                *(int*)num = jumpTarget.ToInt32();
+                MemOps.WriteInt32Cell(_indirectTargetLoc, jumpTarget.ToInt32());
                 diag.PatchType = "Indirect(FF 25) x86";
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else if (b == 232 || b == 233)
             {
@@ -2792,14 +1565,11 @@ namespace DynamicHook
                 }
                 _patchType = 2;
                 _patchAddress = targetPtr;
-                _originalBytes = new byte[5];
-                Marshal.Copy(targetPtr, _originalBytes, 0, 5);
+                _originalBytes = MemOps.ReadBytes(targetPtr, 5);
                 byte[] array = Jumper.BuildJump(targetPtr, jumpTarget);
-                Memory.ProtectWritable(targetPtr, array.Length);
-                Marshal.Copy(array, 0, targetPtr, array.Length);
-                Memory.ProtectExecutable(targetPtr, array.Length);
+                MemOps.WriteBytesProtected(targetPtr, array);
                 diag.PatchType = ((b == 232) ? "FixupPrecode(E8->E9) x86" : "DirectJump(E9) x86");
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else if (b == 0xB8)
             {
@@ -2825,7 +1595,7 @@ namespace DynamicHook
                     _patchAddress = jitAddr;
                     _originalBytes = Jumper.Install(jitAddr, jumpTarget);
                     diag.PatchType = "B8Precode->JitCode(5-byte) x86";
-                    diag.InstalledBytes = ReadBytesSafe(jitAddr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(jitAddr, 16);
                 }
                 else
                 {
@@ -2834,7 +1604,7 @@ namespace DynamicHook
                     _patchAddress = targetPtr;
                     _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                     diag.PatchType = "B8Precode(fallback 5-byte) x86";
-                    diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
                 }
             }
             else if (!MethodEntryResolver.IsJump(targetPtr))
@@ -2843,7 +1613,7 @@ namespace DynamicHook
                 _patchAddress = targetPtr;
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                 diag.PatchType = "JitCode(5-byte) x86";
-                diag.InstalledBytes = ReadBytesSafe(targetPtr, 16);
+                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else
             {
@@ -2854,7 +1624,7 @@ namespace DynamicHook
                     _patchAddress = intPtr;
                     _originalBytes = Jumper.Install(intPtr, jumpTarget);
                     diag.PatchType = "ResolvedJitCode(5-byte) x86";
-                    diag.InstalledBytes = ReadBytesSafe(intPtr, 16);
+                    diag.InstalledBytes = MemOps.ReadBytesSafe(intPtr, 16);
                 }
                 else
                 {
@@ -3025,135 +1795,9 @@ namespace DynamicHook
             thread.Join();
             if (ex != null)
             {
-                throw ex;
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
             }
             return result;
-        }
-
-        /// <summary>
-        /// Invokes the method via Delegate.CreateDelegate + DynamicInvoke.
-        /// This avoids RuntimeMethodHandle.InvokeMethod (used by MethodInfo.Invoke)
-        /// which crashes with 0x80131506 for generic methods after hook patching.
-        /// Delegate.DynamicInvoke uses a different code path that calls the
-        /// delegate's Invoke method directly.
-        /// </summary>
-        private object InvokeViaDelegate(MethodInfo methodInfo, object instance, object[] args)
-        {
-            ParameterInfo[] parameters = methodInfo.GetParameters();
-            Type returnType = methodInfo.ReturnType;
-            bool isVoid = returnType == typeof(void);
-
-            // Build the type argument list for the delegate.
-            // For instance methods, the first type arg is the declaring type (open delegate).
-            int extraForInstance = methodInfo.IsStatic ? 0 : 1;
-            int totalTypeArgs = parameters.Length + extraForInstance + (isVoid ? 0 : 1);
-
-            Type[] typeArgs = new Type[totalTypeArgs];
-            int idx = 0;
-            if (!methodInfo.IsStatic)
-            {
-                typeArgs[idx++] = methodInfo.DeclaringType;
-            }
-            for (int i = 0; i < parameters.Length; i++)
-            {
-                typeArgs[idx++] = parameters[i].ParameterType;
-            }
-            if (!isVoid)
-            {
-                typeArgs[idx++] = returnType;
-            }
-
-            // Get the generic delegate type (Func<...> or Action<...>)
-            string delegateName = isVoid ? "System.Action`" : "System.Func`";
-            Type openDelegateType = Type.GetType(delegateName + totalTypeArgs);
-            if (openDelegateType == null)
-            {
-                // Fallback to MethodInfo.Invoke for unsupported arities
-                return methodInfo.IsStatic
-                    ? methodInfo.Invoke(null, args)
-                    : methodInfo.Invoke(instance, args);
-            }
-
-            Type delegateType = openDelegateType.MakeGenericType(typeArgs);
-
-            // Create an open delegate (null target). For instance methods, the
-            // instance is passed as the first DynamicInvoke argument.
-            Delegate del = Delegate.CreateDelegate(delegateType, null, methodInfo);
-
-            // Build the argument array for DynamicInvoke
-            object[] invokeArgs;
-            if (methodInfo.IsStatic)
-            {
-                invokeArgs = args ?? Array.Empty<object>();
-            }
-            else
-            {
-                invokeArgs = new object[(args?.Length ?? 0) + 1];
-                invokeArgs[0] = instance;
-                if (args != null)
-                {
-                    Array.Copy(args, 0, invokeArgs, 1, args.Length);
-                }
-            }
-
-            return del.DynamicInvoke(invokeArgs);
-        }
-
-        /// <summary>
-        /// CallOriginal path for generic methods: restores ONLY slots + inner code
-        /// patch (NOT precode patches), calls via MethodInfo.Invoke on a clean
-        /// thread, then re-applies. Precode patches are left untouched to avoid
-        /// 0x80131506 (ExecutionEngineException) on .NET 8.
-        /// </summary>
-        private object CallOriginalGenericViaRestore(MethodInfo methodInfo, object instance, object[] args)
-        {
-            if (_callOrigTrampoline != IntPtr.Zero)
-            {
-                return InvokeViaTrampolineNative(methodInfo, instance, args);
-            }
-            RestoreAll();
-            try
-            {
-                if (methodInfo.IsStatic)
-                    return InvokeOnCleanThread(() => methodInfo.Invoke(null, args));
-                return InvokeOnCleanThread(() => methodInfo.Invoke(instance, args));
-            }
-            finally
-            {
-                ReapplyAll();
-            }
-        }
-
-        /// <summary>
-        /// Calls the copy-prologue trampoline via Marshal.GetDelegateForFunctionPointer
-        /// (native delegate) instead of delegate* (managed function pointer). This
-        /// avoids the SEHException that occurs when calling raw VirtualAlloc'd memory
-        /// via delegate* on .NET 8. The trampoline sets up R10 (generic dict), runs
-        /// the copied prologue, and JMPs to the original JIT code past the patch.
-        /// No RestoreAll/ReapplyAll is needed.
-        /// </summary>
-        private object InvokeViaTrampolineNative(MethodInfo methodInfo, object instance, object[] args)
-        {
-            ParameterInfo[] parameters = methodInfo.GetParameters();
-            bool isVoid = methodInfo.ReturnType == typeof(void);
-
-            int argCount = parameters.Length;
-            if (!methodInfo.IsStatic)
-                argCount++;
-            if (argCount > 4)
-                throw new NotSupportedException("Trampoline supports at most 4 arguments; actual: " + argCount);
-
-            object[] flatArgs = new object[argCount];
-            int slot = 0;
-            if (!methodInfo.IsStatic)
-                flatArgs[slot++] = instance;
-            if (args != null)
-            {
-                for (int i = 0; i < args.Length; i++)
-                    flatArgs[slot++] = args[i];
-            }
-
-            return InvokeViaIntPtrDelegate(_callOrigTrampoline, flatArgs, isVoid);
         }
 
         /// <summary>
@@ -3213,9 +1857,12 @@ namespace DynamicHook
             {
                 flatArgs[slot++] = instance;
             }
-            for (int i = 0; i < args.Length; i++)
+            if (args != null)
             {
-                flatArgs[slot++] = args[i];
+                for (int i = 0; i < args.Length; i++)
+                {
+                    flatArgs[slot++] = args[i];
+                }
             }
 
             // On .NET 5+ we can use delegate* (managed function pointers) which keep
@@ -3377,49 +2024,35 @@ namespace DynamicHook
             RestoreAll();
             if (_nearTrampoline != IntPtr.Zero)
             {
-                try
-                {
-                    Memory.FreeExec(_nearTrampoline, 12);
-                }
-                catch
-                {
-                }
+                SafeTry("FreeExec nearTrampoline", () => Memory.FreeExec(_nearTrampoline, 12));
                 _nearTrampoline = IntPtr.Zero;
             }
             if (_secondaryTrampoline != IntPtr.Zero)
             {
-                try
-                {
-                    Memory.FreeExec(_secondaryTrampoline, 12);
-                }
-                catch
-                {
-                }
+                SafeTry("FreeExec secondaryTrampoline", () => Memory.FreeExec(_secondaryTrampoline, 12));
                 _secondaryTrampoline = IntPtr.Zero;
-            }
-            if (_genericAdapter != IntPtr.Zero)
-            {
-                try
-                {
-                    Memory.FreeExec(_genericAdapter, 128);
-                }
-                catch
-                {
-                }
-                _genericAdapter = IntPtr.Zero;
             }
             if (_callOrigTrampoline != IntPtr.Zero)
             {
-                try
-                {
-                    Memory.FreeExec(_callOrigTrampoline, _callOrigTrampSize);
-                }
-                catch
-                {
-                }
+                SafeTry("FreeExec callOrigTrampoline", () => Memory.FreeExec(_callOrigTrampoline, _callOrigTrampSize));
                 _callOrigTrampoline = IntPtr.Zero;
             }
             _isInstalled = false;
+        }
+
+        private void SafeTry(string description, Action action)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                if (DiagInfo != null)
+                {
+                    DiagInfo.PatchError += "; " + description + ": " + ex.Message;
+                }
+            }
         }
 
         private void RestoreAll()
@@ -3428,30 +2061,10 @@ namespace DynamicHook
             {
                 foreach (IntPtr slotAddress in _slotAddresses)
                 {
-                    try
-                    {
-                        SlotPatcher.ReplaceSlot(slotAddress, _originalSlotValue);
-                    }
-                    catch
-                    {
-                    }
+                    SafeTry("RestoreSlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, _originalSlotValue));
                 }
             }
             RestoreCodePatch();
-            if (_overridePatches == null)
-            {
-                return;
-            }
-            foreach (OverridePatch overridePatch in _overridePatches)
-            {
-                try
-                {
-                    Jumper.Restore(overridePatch.Entry, overridePatch.OriginalBytes);
-                }
-                catch
-                {
-                }
-            }
         }
 
         private void RestoreCodePatch()
@@ -3459,124 +2072,40 @@ namespace DynamicHook
             switch (_patchType)
             {
                 case 1:
-                    if (!(_indirectTargetLoc != IntPtr.Zero))
+                    if (_indirectTargetLoc == IntPtr.Zero)
                     {
                         break;
                     }
-                    try
-                    {
-                        int size = IntPtr.Size;
-                        Memory.ProtectReadWrite(_indirectTargetLoc, size);
-                        if (size == 8)
-                        {
-                            Marshal.WriteInt64(_indirectTargetLoc, _originalIndirectTarget.ToInt64());
-                        }
-                        else
-                        {
-                            Marshal.WriteInt32(_indirectTargetLoc, _originalIndirectTarget.ToInt32());
-                        }
-                    }
-                    catch
-                    {
-                    }
+                    SafeTry("Restore indirectTargetLoc", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _originalIndirectTarget));
                     break;
                 case 2:
                     if (_patchAddress != IntPtr.Zero && _originalBytes != null)
                     {
-                        try
-                        {
-                            Jumper.Restore(_patchAddress, _originalBytes);
-                        }
-                        catch
-                        {
-                        }
+                        SafeTry("Restore patchAddress case2", () => Jumper.Restore(_patchAddress, _originalBytes));
                     }
                     break;
                 case 3:
                     if (_patchAddress != IntPtr.Zero && _originalBytes != null)
                     {
-                        try
-                        {
-                            Jumper.Restore(_patchAddress, _originalBytes);
-                        }
-                        catch
-                        {
-                        }
+                        SafeTry("Restore patchAddress case3", () => Jumper.Restore(_patchAddress, _originalBytes));
                     }
                     break;
             }
             if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero && _secondaryJitOriginalBytes != null)
             {
-                try
-                {
-                    Jumper.Restore(_secondaryJitAddress, _secondaryJitOriginalBytes);
-                }
-                catch
-                {
-                }
+                SafeTry("Restore secondaryJit", () => Jumper.Restore(_secondaryJitAddress, _secondaryJitOriginalBytes));
             }
-            // Restore the target1 fixup thunk to its original bytes
             if (_hasTarget1Patch && _target1Address != IntPtr.Zero && _target1OriginalBytes != null)
             {
-                try
-                {
-                    Jumper.Restore(_target1Address, _target1OriginalBytes);
-                }
-                catch
-                {
-                }
+                SafeTry("Restore target1", () => Jumper.Restore(_target1Address, _target1OriginalBytes));
             }
-            // Restore the inner code address (fixup target) to its original bytes
             if (_hasInnerCodePatch && _innerCodeAddress != IntPtr.Zero && _innerCodeOriginalBytes != null)
             {
-                try
-                {
-                    Jumper.Restore(_innerCodeAddress, _innerCodeOriginalBytes);
-                }
-                catch
-                {
-                }
+                SafeTry("Restore innerCode", () => Jumper.Restore(_innerCodeAddress, _innerCodeOriginalBytes));
             }
-            // Restore the target2 data cell to its original value (Precode2ndTarget)
             if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
             {
-                try
-                {
-                    int size = IntPtr.Size;
-                    Memory.ProtectReadWrite(_target2Loc, size);
-                    if (size == 8)
-                    {
-                        Marshal.WriteInt64(_target2Loc, _target2OriginalValue.ToInt64());
-                    }
-                    else
-                    {
-                        Marshal.WriteInt32(_target2Loc, _target2OriginalValue.ToInt32());
-                    }
-                }
-                catch
-                {
-                }
-            }
-            // Restore the first FF 25's indirect target to its original value
-            // (the JIT code address backpatched by PrepareMethod).
-            if (_hasFirstIndirectPatch && _firstIndirectLoc != IntPtr.Zero)
-            {
-                try
-                {
-                    int size = IntPtr.Size;
-                    Memory.ProtectReadWrite(_firstIndirectLoc, size);
-                    if (size == 8)
-                    {
-                        Marshal.WriteInt64(_firstIndirectLoc, _originalFirstIndirect.ToInt64());
-                    }
-                    else
-                    {
-                        Marshal.WriteInt32(_firstIndirectLoc, _originalFirstIndirect.ToInt32());
-                    }
-                }
-                catch
-                {
-                }
+                SafeTry("Restore target2", () => MemOps.WriteIntPtrCell(_target2Loc, _target2OriginalValue));
             }
         }
 
@@ -3586,30 +2115,10 @@ namespace DynamicHook
             {
                 foreach (IntPtr slotAddress in _slotAddresses)
                 {
-                    try
-                    {
-                        SlotPatcher.ReplaceSlot(slotAddress, _newSlotValue);
-                    }
-                    catch
-                    {
-                    }
+                    SafeTry("ReapplySlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, _newSlotValue));
                 }
             }
             ReapplyCodePatch();
-            if (_overridePatches == null)
-            {
-                return;
-            }
-            foreach (OverridePatch overridePatch in _overridePatches)
-            {
-                try
-                {
-                    Jumper.WriteJump(overridePatch.Entry, _newSlotValue);
-                }
-                catch
-                {
-                }
-            }
         }
 
         private void ReapplyCodePatch()
@@ -3617,160 +2126,59 @@ namespace DynamicHook
             switch (_patchType)
             {
                 case 1:
-                    if (!(_indirectTargetLoc != IntPtr.Zero))
+                    if (_indirectTargetLoc == IntPtr.Zero)
                     {
                         break;
                     }
-                    try
-                    {
-                        int size = IntPtr.Size;
-                        Memory.ProtectReadWrite(_indirectTargetLoc, size);
-                        if (size == 8)
-                        {
-                            Marshal.WriteInt64(_indirectTargetLoc, _newSlotValue.ToInt64());
-                        }
-                        else
-                        {
-                            Marshal.WriteInt32(_indirectTargetLoc, _newSlotValue.ToInt32());
-                        }
-                    }
-                    catch
-                    {
-                    }
+                    SafeTry("Reapply indirectTargetLoc", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _newSlotValue));
                     break;
                 case 2:
                     if (_patchAddress != IntPtr.Zero && _nearTrampoline != IntPtr.Zero)
                     {
-                        try
+                        SafeTry("Reapply patchAddress case2", () =>
                         {
-                            int value = (int)(_nearTrampoline.ToInt64() - (_patchAddress.ToInt64() + 5));
-                            byte[] array = new byte[5] { 233, 0, 0, 0, 0 };
-                            BitConverter.GetBytes(value).CopyTo(array, 1);
-                            Memory.ProtectWritable(_patchAddress, 5);
-                            Marshal.Copy(array, 0, _patchAddress, 5);
-                            Memory.ProtectExecutable(_patchAddress, 5);
-                        }
-                        catch
-                        {
-                        }
+                            byte[] array = Jumper.BuildRelJump(_patchAddress, _nearTrampoline);
+                            MemOps.WriteBytesProtected(_patchAddress, array);
+                        });
                     }
                     break;
                 case 3:
                     if (_patchAddress != IntPtr.Zero)
                     {
-                        try
-                        {
-                            Jumper.WriteJump(_patchAddress, _newSlotValue);
-                        }
-                        catch
-                        {
-                        }
+                        SafeTry("Reapply patchAddress case3", () => Jumper.WriteJump(_patchAddress, _newSlotValue));
                     }
                     break;
             }
             if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero)
             {
-                try
+                SafeTry("Reapply secondaryJit", () =>
                 {
-                    int rel;
-                    if (_secondaryTrampoline != IntPtr.Zero)
-                    {
-                        // x64: jump to near trampoline which jumps to hook
-                        rel = (int)(_secondaryTrampoline.ToInt64() - (_secondaryJitAddress.ToInt64() + 5));
-                    }
-                    else
-                    {
-                        // x86: direct jump to hook (no trampoline needed)
-                        rel = _newSlotValue.ToInt32() - (_secondaryJitAddress.ToInt32() + 5);
-                    }
-                    byte[] patch = new byte[5] { 233, 0, 0, 0, 0 };
-                    BitConverter.GetBytes(rel).CopyTo(patch, 1);
-                    Memory.ProtectWritable(_secondaryJitAddress, 5);
-                    Marshal.Copy(patch, 0, _secondaryJitAddress, 5);
-                    Memory.ProtectExecutable(_secondaryJitAddress, 5);
-                }
-                catch
-                {
-                }
+                    IntPtr secondaryTarget = _secondaryTrampoline != IntPtr.Zero
+                        ? _secondaryTrampoline
+                        : _newSlotValue;
+                    byte[] patch = Jumper.BuildRelJump(_secondaryJitAddress, secondaryTarget);
+                    MemOps.WriteBytesProtected(_secondaryJitAddress, patch);
+                });
             }
-            // Reapply the target1 fixup thunk patch (12-byte absolute jump to hook)
             if (_hasTarget1Patch && _target1Address != IntPtr.Zero)
             {
-                try
+                SafeTry("Reapply target1", () =>
                 {
-                    byte[] patch = new byte[12]
-                    {
-                    72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                    byte.MaxValue, 224
-                    };
-                    BitConverter.GetBytes(_newSlotValue.ToInt64()).CopyTo(patch, 2);
-                    Memory.ProtectWritable(_target1Address, 12);
-                    Marshal.Copy(patch, 0, _target1Address, 12);
-                    Memory.ProtectExecutable(_target1Address, 12);
-                }
-                catch
-                {
-                }
+                    byte[] patch = Jumper.BuildAbsJumpX64(_newSlotValue);
+                    MemOps.WriteBytesProtected(_target1Address, patch);
+                });
             }
-            // Reapply the inner code patch (12-byte absolute jump to hook)
             if (_hasInnerCodePatch && _innerCodeAddress != IntPtr.Zero)
             {
-                try
+                SafeTry("Reapply innerCode", () =>
                 {
-                    byte[] patch = new byte[12]
-                    {
-                    72, 184, 0, 0, 0, 0, 0, 0, 0, 0,
-                    byte.MaxValue, 224
-                    };
-                    BitConverter.GetBytes(_newSlotValue.ToInt64()).CopyTo(patch, 2);
-                    Memory.ProtectWritable(_innerCodeAddress, 12);
-                    Marshal.Copy(patch, 0, _innerCodeAddress, 12);
-                    Memory.ProtectExecutable(_innerCodeAddress, 12);
-                }
-                catch
-                {
-                }
+                    byte[] patch = Jumper.BuildAbsJumpX64(_newSlotValue);
+                    MemOps.WriteBytesProtected(_innerCodeAddress, patch);
+                });
             }
-            // Reapply the target2 data cell patch (Precode2ndTarget -> hook)
             if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
             {
-                try
-                {
-                    int size = IntPtr.Size;
-                    Memory.ProtectReadWrite(_target2Loc, size);
-                    if (size == 8)
-                    {
-                        Marshal.WriteInt64(_target2Loc, _newSlotValue.ToInt64());
-                    }
-                    else
-                    {
-                        Marshal.WriteInt32(_target2Loc, _newSlotValue.ToInt32());
-                    }
-                }
-                catch
-                {
-                }
-            }
-            // Reapply the first FF 25 redirect to offset 6 (precodeAddr + 6).
-            if (_hasFirstIndirectPatch && _firstIndirectLoc != IntPtr.Zero && _precodeAddr != IntPtr.Zero)
-            {
-                try
-                {
-                    int size = IntPtr.Size;
-                    long redirectTarget = _precodeAddr.ToInt64() + 6;
-                    Memory.ProtectReadWrite(_firstIndirectLoc, size);
-                    if (size == 8)
-                    {
-                        Marshal.WriteInt64(_firstIndirectLoc, redirectTarget);
-                    }
-                    else
-                    {
-                        Marshal.WriteInt32(_firstIndirectLoc, (int)redirectTarget);
-                    }
-                }
-                catch
-                {
-                }
+                SafeTry("Reapply target2", () => MemOps.WriteIntPtrCell(_target2Loc, _newSlotValue));
             }
         }
 
@@ -3783,297 +2191,6 @@ namespace DynamicHook
             }
         }
 
-        private void PatchVirtualOverrides(IntPtr jumpTarget)
-        {
-            try
-            {
-                MethodInfo methodInfo = _targetMethod as MethodInfo;
-                Type type = methodInfo?.DeclaringType;
-                if (type == null)
-                {
-                    return;
-                }
-                Type[] types = (from p in methodInfo.GetParameters()
-                                select p.ParameterType).ToArray();
-                List<MethodInfo> list = new List<MethodInfo>();
-                Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
-                foreach (Assembly assembly in assemblies)
-                {
-                    if (assembly.IsDynamic)
-                    {
-                        continue;
-                    }
-                    Type[] types2;
-                    try
-                    {
-                        types2 = assembly.GetTypes();
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-                    Type[] array = types2;
-                    foreach (Type type2 in array)
-                    {
-                        if (type2 == type || !type.IsAssignableFrom(type2) || !type2.IsClass || type2.IsAbstract)
-                        {
-                            continue;
-                        }
-                        MethodInfo method;
-                        try
-                        {
-                            method = type2.GetMethod(methodInfo.Name, BindingFlags.Instance | BindingFlags.Public, null, types, null);
-                        }
-                        catch
-                        {
-                            continue;
-                        }
-                        if (method == null || method.DeclaringType == type)
-                        {
-                            continue;
-                        }
-                        try
-                        {
-                            if (method.GetBaseDefinition() == methodInfo)
-                            {
-                                list.Add(method);
-                            }
-                        }
-                        catch
-                        {
-                        }
-                    }
-                }
-                if (list.Count == 0)
-                {
-                    return;
-                }
-                _overridePatches = new List<OverridePatch>();
-                foreach (MethodInfo item in list)
-                {
-                    RuntimeHelpers.PrepareMethod(item.MethodHandle);
-                    IntPtr functionPointer = item.MethodHandle.GetFunctionPointer();
-                    IntPtr value = item.MethodHandle.Value;
-                    IntPtr methodTable = IntPtr.Zero;
-                    if (item.DeclaringType != null)
-                    {
-                        methodTable = item.DeclaringType.TypeHandle.Value;
-                    }
-                    List<IntPtr> list2 = SlotPatcher.FindSlots(value, methodTable, functionPointer);
-                    foreach (IntPtr item2 in list2)
-                    {
-                        SlotPatcher.ReplaceSlot(item2, jumpTarget);
-                    }
-                    byte[] originalBytes = Jumper.Install(functionPointer, jumpTarget);
-                    _overridePatches.Add(new OverridePatch
-                    {
-                        Entry = functionPointer,
-                        OriginalBytes = originalBytes,
-                        Slots = list2
-                    });
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static byte[] ReadBytesSafe(IntPtr addr, int count)
-        {
-            if (addr == IntPtr.Zero) return null;
-            if (!Memory.IsReadable(addr, count)) return null;
-            try
-            {
-                byte[] array = new byte[count];
-                Marshal.Copy(addr, array, 0, count);
-                return array;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Non-generic delegate types used to invoke native function pointers via
-    /// Marshal.GetDelegateForFunctionPointer, which rejects generic delegate types
-    /// (e.g. Func&lt;T1,T2,TResult&gt;) and delegates that return or accept "variant"
-    /// types such as <c>object</c>. Every reference type shares the same native
-    /// representation (an object pointer, 8 bytes on x64), so a delegate declared
-    /// with <c>IntPtr</c> parameters and <c>IntPtr</c> return can faithfully call a
-    /// native function whose real signature uses any reference types; the caller
-    /// converts objects to/from raw pointer values via <see cref="ObjPtr"/>.
-    /// Value-type parameters/returns are not covered by this path; callers fall
-    /// back to the restore/invoke/reapply path for those signatures.
-    /// </summary>
-    internal delegate IntPtr FuncIntPtr0();
-    internal delegate IntPtr FuncIntPtr1(IntPtr a);
-    internal delegate IntPtr FuncIntPtr2(IntPtr a, IntPtr b);
-    internal delegate IntPtr FuncIntPtr3(IntPtr a, IntPtr b, IntPtr c);
-    internal delegate IntPtr FuncIntPtr4(IntPtr a, IntPtr b, IntPtr c, IntPtr d);
-    internal delegate void ActionIntPtr0();
-    internal delegate void ActionIntPtr1(IntPtr a);
-    internal delegate void ActionIntPtr2(IntPtr a, IntPtr b);
-    internal delegate void ActionIntPtr3(IntPtr a, IntPtr b, IntPtr c);
-    internal delegate void ActionIntPtr4(IntPtr a, IntPtr b, IntPtr c, IntPtr d);
-
-    /// <summary>
-    /// Overlays a managed <c>object</c> reference with a raw <c>IntPtr</c> so that
-    /// an object pointer obtained from native code (via a IntPtr-returning delegate)
-    /// can be reinterpreted back into a tracked managed reference. Conversion is
-    /// implemented with <c>TypedReference</c> (<c>__makeref</c>/<c>__refvalue</c>)
-    /// because the CLR forbids explicit-layout structs that overlap an object field
-    /// with a non-object field, and <c>Marshal.GetDelegateForFunctionPointer</c>
-    /// rejects delegates whose return/parameter type is <c>object</c>.
-    /// </summary>
-    internal static class ObjPtr
-    {
-        public static unsafe IntPtr From(object obj)
-        {
-            if (obj == null)
-            {
-                return IntPtr.Zero;
-            }
-            // __makeref yields a TypedReference whose first field is the raw
-            // managed object reference (pointer to the object header).
-            TypedReference tr = __makeref(obj);
-            return *(IntPtr*)&tr;
-        }
-
-        public static unsafe object To(IntPtr ptr)
-        {
-            if (ptr == IntPtr.Zero)
-            {
-                return null;
-            }
-            // Build a TypedReference whose value field points to the object, then
-            // dereference it as object. The type handle in the TypedReference is
-            // irrelevant when the compile-time type is 'object'.
-            object dummy = null;
-            TypedReference tr = __makeref(dummy);
-            *(IntPtr*)&tr = ptr;
-            return __refvalue(tr, object);
-        }
-    }
-
-    public class HookDiagInfo
-    {
-        public string TargetMethod;
-
-        public string HookMethod;
-
-        public IntPtr PrecodeAddr;
-
-        public byte[] PrecodeBytes;
-
-        public int SlotCount;
-
-        public List<long> SlotAddresses;
-
-        public string SlotError;
-
-        public string PatchType;
-
-        public string PatchError;
-
-        public bool NeedsGenericAdapter;
-
-        public IntPtr AdapterAddr;
-
-        public byte[] AdapterBytes;
-
-        public IntPtr JumpTargetAddr;
-
-        public byte[] InstalledBytes;
-
-        public IntPtr JitCodeAddr;
-
-        public byte[] JitCodeOriginalBytes;
-
-        public byte[] JitCodePatchedBytes;
-
-        public IntPtr PrecodeFirstTargetAddr;
-
-        public IntPtr PrecodeSecondTargetAddr;
-
-        public byte[] Target1Bytes;
-
-        public byte[] MethodDescDump;
-
-        public string DelegateStatus;
-
-        public string CallOrigStatus;
-
-        public override string ToString()
-        {
-            StringBuilder stringBuilder = new StringBuilder();
-            stringBuilder.AppendLine("Target: " + TargetMethod);
-            stringBuilder.AppendLine("Hook:   " + HookMethod);
-            stringBuilder.AppendLine($"Precode:       0x{PrecodeAddr.ToInt64():X16}  Bytes: {FormatBytes(PrecodeBytes)}");
-            stringBuilder.AppendLine($"Slots found:   {SlotCount}");
-            if (SlotAddresses != null && SlotAddresses.Count > 0)
-            {
-                stringBuilder.AppendLine("Slot addrs:    " + string.Join(", ", from a in SlotAddresses.Take(5)
-                                                                               select $"0x{a:X16}"));
-            }
-            if (!string.IsNullOrEmpty(SlotError))
-            {
-                stringBuilder.AppendLine("Slot error:    " + SlotError);
-            }
-            stringBuilder.AppendLine("Patch type:    " + (PatchType ?? "none"));
-            if (!string.IsNullOrEmpty(PatchError))
-            {
-                stringBuilder.AppendLine("Patch error:   " + PatchError);
-            }
-            stringBuilder.AppendLine($"NeedsAdapter:  {NeedsGenericAdapter}");
-            if (NeedsGenericAdapter && AdapterAddr != IntPtr.Zero)
-            {
-                stringBuilder.AppendLine($"Adapter:       0x{AdapterAddr.ToInt64():X16}  Bytes: {FormatBytes(AdapterBytes)}");
-            }
-            stringBuilder.AppendLine($"JumpTarget:    0x{JumpTargetAddr.ToInt64():X16}");
-            stringBuilder.AppendLine("Installed:     Bytes: " + FormatBytes(InstalledBytes));
-            if (JitCodeAddr != IntPtr.Zero)
-            {
-                stringBuilder.AppendLine($"JitCode:       0x{JitCodeAddr.ToInt64():X16}");
-                stringBuilder.AppendLine("JitCodeOrig:   " + FormatBytes(JitCodeOriginalBytes));
-                stringBuilder.AppendLine("JitCodePatched:" + FormatBytes(JitCodePatchedBytes));
-            }
-            if (PrecodeFirstTargetAddr != IntPtr.Zero)
-            {
-                stringBuilder.AppendLine($"Precode1stTarget: 0x{PrecodeFirstTargetAddr.ToInt64():X16}");
-            }
-            if (Target1Bytes != null)
-            {
-                stringBuilder.AppendLine("Target1Bytes:  " + FormatBytes(Target1Bytes));
-            }
-            if (PrecodeSecondTargetAddr != IntPtr.Zero)
-            {
-                stringBuilder.AppendLine($"Precode2ndTarget: 0x{PrecodeSecondTargetAddr.ToInt64():X16}");
-            }
-            if (MethodDescDump != null)
-            {
-                stringBuilder.AppendLine("MethodDesc:    " + FormatBytes(MethodDescDump));
-            }
-            if (!string.IsNullOrEmpty(DelegateStatus))
-            {
-                stringBuilder.AppendLine("Delegate:      " + DelegateStatus);
-            }
-            if (!string.IsNullOrEmpty(CallOrigStatus))
-            {
-                stringBuilder.AppendLine("CallOrig:      " + CallOrigStatus);
-            }
-            return stringBuilder.ToString();
-        }
-
-        private static string FormatBytes(byte[] bytes)
-        {
-            if (bytes == null)
-            {
-                return "<null>";
-            }
-            return string.Join(" ", from b in bytes.Take(32)
-                                    select $"{b:X2}") + ((bytes.Length > 32) ? " ..." : "");
-        }
+        // ReadBytesSafe moved to MemOps.ReadBytesSafe (unified low-level API).
     }
 }
