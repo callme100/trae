@@ -1,7 +1,5 @@
 using System;
 using System.Reflection;
-using System.Runtime.CompilerServices;
-using DynamicHook;
 using Xunit;
 using Xunit.Abstractions;
 

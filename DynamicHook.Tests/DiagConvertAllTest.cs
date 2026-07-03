@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Text;
 using Xunit;
 using Xunit.Abstractions;
@@ -111,7 +110,7 @@ namespace DynamicHook.Tests
                         bool needsGeneric = needsGenericField != null && (bool)needsGenericField.GetValue(hook);
                         if (needsGeneric)
                         {
-                            _output.WriteLine($"  [0..9]  MOV R10, imm64: {p[0]:X2} {p[1]:X2} {BitConverter.ToInt64(new byte[]{p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9]}, 0):X16}");
+                            _output.WriteLine($"  [0..9]  MOV R10, imm64: {p[0]:X2} {p[1]:X2} {BitConverter.ToInt64(new byte[] { p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9] }, 0):X16}");
                             off = 10;
                         }
                         // Determine copyLen: trampSize - prefixLen - 12
@@ -122,7 +121,7 @@ namespace DynamicHook.Tests
                         for (int i = 0; i < copyLen; i++) sb.Append($"{p[off + i]:X2} ");
                         _output.WriteLine(sb.ToString()); sb.Clear();
                         off += copyLen;
-                        _output.WriteLine($"  [{off}..{off + 11}]  MOV RAX, imm64; JMP RAX: {p[off]:X2} {p[off + 1]:X2} {BitConverter.ToInt64(new byte[]{p[off + 2],p[off + 3],p[off + 4],p[off + 5],p[off + 6],p[off + 7],p[off + 8],p[off + 9]}, 0):X16} {p[off + 10]:X2} {p[off + 11]:X2}");
+                        _output.WriteLine($"  [{off}..{off + 11}]  MOV RAX, imm64; JMP RAX: {p[off]:X2} {p[off + 1]:X2} {BitConverter.ToInt64(new byte[] { p[off + 2], p[off + 3], p[off + 4], p[off + 5], p[off + 6], p[off + 7], p[off + 8], p[off + 9] }, 0):X16} {p[off + 10]:X2} {p[off + 11]:X2}");
                     }
                 }
             }
