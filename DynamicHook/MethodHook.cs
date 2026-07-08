@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -421,7 +422,6 @@ namespace DynamicHook
             {
                 throw new ObjectDisposedException("MethodHook");
             }
-            System.Console.Error.WriteLine($"[MethodHook] Install START: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
             HookDiagInfo hookDiagInfo = new HookDiagInfo();
             hookDiagInfo.TargetMethod = _targetMethod.ToString();
             hookDiagInfo.HookMethod = _hookMethod.ToString();
@@ -499,7 +499,6 @@ namespace DynamicHook
             _isInstalled = true;
             InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
             DiagInfo = hookDiagInfo;
-            System.Console.Error.WriteLine($"[MethodHook] Install END: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
         }
 
         private void PrepareMethod(MethodBase method)
@@ -3131,10 +3130,7 @@ namespace DynamicHook
             {
                 return;
             }
-            System.Console.Error.WriteLine($"[MethodHook] Uninstall START: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
-            System.Console.Error.WriteLine($"[MethodHook] Uninstall: calling RestoreAll");
             RestoreAll();
-            System.Console.Error.WriteLine($"[MethodHook] Uninstall: RestoreAll done");
             if (_nearTrampoline != IntPtr.Zero)
             {
                 SafeTry("FreeExec nearTrampoline", () => Memory.FreeExec(_nearTrampoline, 12));
@@ -3156,7 +3152,6 @@ namespace DynamicHook
                 _hookAdapterTrampoline = IntPtr.Zero;
             }
             _isInstalled = false;
-            System.Console.Error.WriteLine($"[MethodHook] Uninstall END: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
         }
 
         private void SafeTry(string description, Action action)
