@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      目标框架覆盖 .NET Framework 4.x、.NET 6/8/10。
+      net472 需要 Windows + MSBuild（在 Linux 上通过 Microsoft.NETFramework.ReferenceAssemblies 引用程序集构建）。
+      net10 仅在安装了 .NET 10 SDK 的机器上可构建/运行；未安装时该 TFM 会被自动跳过。
+    -->
+    <TargetFrameworks>net472;net6.0;net8.0</TargetFrameworks>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <!-- 禁用分层编译以减少非确定性（hook 依赖稳定的 JIT 代码地址）。 -->
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <!--
+    仅当构建机器上安装了支持 .NET 10 的 SDK 时才追加 net10.0 目标。
+    通过探测 SDK 自带的 Microsoft.NETCore.App.Ref 版本是否 >= 10.0.0 来判断。
+    若不可用则自动跳过，不影响其余 TFM 的构建。
+  -->
+  <PropertyGroup Condition="'$(NET10AppRefPackageVersion)' != '' OR Exists('$(MSBuildSDKsPath)/../shared/Microsoft.NETCore.App/10.')">
+    <TargetFrameworks>$(TargetFrameworks);net10.0</TargetFrameworks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- 提供 net472 引用程序集，使 net472 在非 Windows 环境也能编译。 -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DynamicHook\DynamicHook.csproj" />
+  </ItemGroup>
+
+</Project>
