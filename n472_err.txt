@@ -1,0 +1,8 @@
+﻿[EnsureJitCompiled] Precode NOT backpatched: before=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00, after=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00, after=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00, after=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00, after=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-0B-C2-EE-FF-5F-00-00-10-6C-48-A6-FC-7F-00-00, after=E9-0B-C2-EE-FF-5F-00-00-10-6C-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-BB-C1-EE-FF-5F-00-00-E8-73-48-A6-FC-7F-00-00, after=E9-BB-C1-EE-FF-5F-00-00-E8-73-48-A6-FC-7F-00-00
+[EnsureJitCompiled] Precode NOT backpatched: before=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00, after=E9-AB-DD-EE-FF-5F-00-00-B8-48-48-A6-FC-7F-00-00
+

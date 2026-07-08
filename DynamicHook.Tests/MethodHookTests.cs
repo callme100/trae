@@ -174,6 +174,62 @@ namespace DynamicHook.Tests
             Assert.Equal(0, TestState.HookCallCount);
         }
 
+        [Fact]
+        [MethodImpl(MethodImplOptions.NoOptimization | MethodImplOptions.NoInlining)]
+        public void Hook_ConvertAll_DirectCall_WithCallOriginal()
+        {
+            // On .NET 6+, direct calls to generic methods are backpatched to call JIT
+            // code directly, bypassing the precode. Without a secondary JIT patch, the
+            // hook is not triggered. With a secondary JIT patch, CallOriginal crashes
+            // with 0x80131506 (CLR internal error during MethodInfo.Invoke type checking).
+            // Direct call support for generic methods is currently limited to .NET Framework 4.x.
+            if (Environment.Version.Major >= 6)
+            {
+                _output.WriteLine("Skipped: direct call to generic methods not supported on .NET 6+");
+                return;
+            }
+
+            TestState.Reset();
+
+            var openMethod = typeof(List<int>).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "ConvertAll" && m.IsGenericMethod);
+            Assert.NotNull(openMethod);
+            var genericTarget = openMethod.MakeGenericMethod(typeof(string));
+            var hookMethod = GetMethod(typeof(HookContainer), "HookConvertAll",
+                new[] { typeof(List<int>), typeof(Converter<int, string>) });
+
+            // Pre-warm: force tier-1 JIT compilation
+            var warmupList = new List<int> { 0 };
+            var warmupResult = warmupList.ConvertAll(x => $"warm{x}");
+            Assert.Single(warmupResult);
+
+            using (var hook = CreateHook(genericTarget, hookMethod))
+            {
+                hook.Install();
+
+                TestState.ActiveHook = hook;
+
+                // Direct call (not via delegate) - exercises the JIT code patch path
+                var list = new List<int> { 1, 2, 3 };
+                var result = list.ConvertAll(new Converter<int, string>(x => $"v{x}"));
+                _output.WriteLine($"Result (direct call): [{string.Join(",", result)}]");
+                _output.WriteLine($"HookCallCount: {TestState.HookCallCount}");
+
+                Assert.Equal("ConvertAll", TestState.LastHookCall);
+                Assert.Equal(1, TestState.HookCallCount);
+                Assert.Equal(3, result.Count);
+                Assert.Equal("v1", result[0]);
+                Assert.Equal("v2", result[1]);
+                Assert.Equal("v3", result[2]);
+            }
+
+            TestState.Reset();
+            var list2 = new List<int> { 10, 20 };
+            var result2 = list2.ConvertAll(x => $"v{x}");
+            Assert.Equal(2, result2.Count);
+            Assert.Equal(0, TestState.HookCallCount);
+        }
+
         // ============================================================
         // 静态方法hook测试
         // ============================================================

@@ -1,0 +1,4 @@
+
+Unhandled Exception: System.AccessViolationException: Attempted to read or write protected memory. This is often an indication that other memory is corrupt.
+   at DynamicHook.ReproConsole.Program.TestColdStartHook() in c:\trae\DynamicHook.Tests\ReproConsole\Program.cs:line 91
+   at DynamicHook.ReproConsole.Program.Main(String[] args) in c:\trae\DynamicHook.Tests\ReproConsole\Program.cs:line 23

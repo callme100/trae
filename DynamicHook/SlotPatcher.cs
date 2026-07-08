@@ -7,13 +7,18 @@ namespace DynamicHook
     {
         public static List<IntPtr> FindSlots(IntPtr methodDesc, IntPtr methodTable, IntPtr value)
         {
+            return FindSlots(methodDesc, methodTable, value, 128);
+        }
+
+        public static List<IntPtr> FindSlots(IntPtr methodDesc, IntPtr methodTable, IntPtr value, int methodDescScanSize)
+        {
             List<IntPtr> list = new List<IntPtr>();
             int size = IntPtr.Size;
             long num = value.ToInt64();
             long num2 = MethodEntryResolver.ResolveRealEntry(value).ToInt64();
             if (methodDesc != IntPtr.Zero)
             {
-                for (int i = 0; i < 128; i += size)
+                for (int i = 0; i < methodDescScanSize; i += size)
                 {
                     if (!Memory.IsReadable(methodDesc + i, size))
                     {

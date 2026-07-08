@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
 using System.Text;
 
 [assembly: InternalsVisibleTo("DynamicHook.Tests")]
@@ -34,11 +35,27 @@ namespace DynamicHook
 
         private IntPtr _nearTrampoline;
 
+        /// <summary>
+        /// Adapter trampoline that shifts registers from the generic calling
+        /// convention (generic dict in RDX for instance / RCX for static) to the
+        /// standard managed calling convention before jumping to the hook.
+        /// Built once in Install() and used as the jump target for ALL patches
+        /// (slot replacement, precode, target1, target2, secondary JIT).
+        /// </summary>
+        private IntPtr _hookAdapterTrampoline;
+
         private bool _hasSecondaryPatch;
 
         private IntPtr _secondaryJitAddress;
 
         private byte[] _secondaryJitOriginalBytes;
+
+        /// <summary>
+        /// Full (32-byte) copy of the original bytes at the secondary JIT address,
+        /// saved BEFORE the 5-byte E9 patch is applied. Used by the call-original
+        /// trampoline to copy/relocate the original prologue.
+        /// </summary>
+        private byte[] _secondaryJitOriginalBytesFull;
 
         private IntPtr _secondaryTrampoline;
 
@@ -66,6 +83,22 @@ namespace DynamicHook
         private IntPtr _target2Loc;
 
         private IntPtr _target2OriginalValue;
+
+        /// <summary>
+        /// On .NET Framework 4.x, generic instance methods have an E9 precode that
+        /// jumps to a fixup thunk. The fixup thunk loads &lt;jit_addr&gt; into RAX
+        /// and JMPs to it. The &lt;jit_addr&gt; may point to a PRESTUB or data
+        /// structure (not directly to JIT code), so patching the TARGET would
+        /// corrupt it. Instead, we patch the &lt;jit_addr&gt; FIELD ITSELF (a
+        /// data pointer at offset 15 in the fixup thunk) to point to the hook
+        /// adapter trampoline. This is a DATA patch (8-byte write), restored/
+        /// reapplied by RestoreCodePatch/ReapplyCodePatch.
+        /// </summary>
+        private bool _hasFixupJitAddrPatch;
+
+        private IntPtr _fixupJitAddrLoc;
+
+        private IntPtr _fixupJitAddrOriginal;
 
         private IntPtr _callOrigTrampoline;
 
@@ -115,6 +148,20 @@ namespace DynamicHook
         }
 
         /// <summary>
+        /// 准备方法并解析到真实 JIT 代码入口指针。返回 IntPtr.Zero 表示失败。
+        /// 抽取自 ScanCallTargets/ScanIndirectCalls/ScanMovRipRelative 共享的 prologue。
+        /// </summary>
+        private static unsafe byte* ResolveJitCodePtr(MethodBase method)
+        {
+            RuntimeHelpers.PrepareMethod(method.MethodHandle);
+            IntPtr entry = method.MethodHandle.GetFunctionPointer();
+            if (entry == IntPtr.Zero) return null;
+            IntPtr jitEntry = MethodEntryResolver.ResolveRealEntry(entry);
+            if (jitEntry != IntPtr.Zero) entry = jitEntry;
+            return (byte*)entry;
+        }
+
+        /// <summary>
         /// 诊断方法：扫描指定方法的 JIT 代码，查找 E8 (CALL rel32) 指令，
         /// 返回所有调用目标地址。用于诊断泛型方法 hook 不生效的问题。
         /// </summary>
@@ -123,13 +170,8 @@ namespace DynamicHook
             List<long> result = new List<long>();
             try
             {
-                RuntimeHelpers.PrepareMethod(method.MethodHandle);
-                IntPtr entry = method.MethodHandle.GetFunctionPointer();
-                if (entry == IntPtr.Zero) return result;
-                // Resolve through precode to get actual JIT code
-                IntPtr jitEntry = MethodEntryResolver.ResolveRealEntry(entry);
-                if (jitEntry != IntPtr.Zero) entry = jitEntry;
-                byte* p = (byte*)entry;
+                byte* p = ResolveJitCodePtr(method);
+                if (p == null) return result;
                 for (int i = 0; i < maxScanBytes - 5; i++)
                 {
                     // E8 xx xx xx xx = CALL rel32
@@ -292,12 +334,8 @@ namespace DynamicHook
             var result = new List<(int, long, long)>();
             try
             {
-                RuntimeHelpers.PrepareMethod(method.MethodHandle);
-                IntPtr entry = method.MethodHandle.GetFunctionPointer();
-                if (entry == IntPtr.Zero) return result;
-                IntPtr jitEntry = MethodEntryResolver.ResolveRealEntry(entry);
-                if (jitEntry != IntPtr.Zero) entry = jitEntry;
-                byte* p = (byte*)entry;
+                byte* p = ResolveJitCodePtr(method);
+                if (p == null) return result;
                 for (int i = 0; i < maxScanBytes - 6; i++)
                 {
                     if (p[i] == 0xFF && p[i + 1] == 0x15)
@@ -327,12 +365,8 @@ namespace DynamicHook
             var result = new List<(int, int, long, long)>();
             try
             {
-                RuntimeHelpers.PrepareMethod(method.MethodHandle);
-                IntPtr entry = method.MethodHandle.GetFunctionPointer();
-                if (entry == IntPtr.Zero) return result;
-                IntPtr jitEntry = MethodEntryResolver.ResolveRealEntry(entry);
-                if (jitEntry != IntPtr.Zero) entry = jitEntry;
-                byte* p = (byte*)entry;
+                byte* p = ResolveJitCodePtr(method);
+                if (p == null) return result;
                 // ModR/M bytes for [rip+disp32]: 05,0D,15,1D,25,2D,35,3D
                 // maps to registers: RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI (for REX.W=48)
                 // or R8-R15 (for REX.W+REX.R=4C)
@@ -385,6 +419,17 @@ namespace DynamicHook
             // dictionary setup (R10), bypassing RuntimeMethodHandle.InvokeMethod
             // which crashes (0x80131506) for hooked generic methods.
             CreateOriginalDelegate();
+            // RuntimeHelpers.PrepareMethod may not fully JIT compile generic methods
+            // on .NET Framework 4.x — it can leave a PRESTUB that gets replaced on
+            // first actual call, overwriting our patch and causing crashes.
+            // Invoke the method once via the delegate's DynamicInvoke to force real
+            // JIT compilation AND backpatch the precode. DynamicInvoke calls the
+            // delegate's Invoke method, which calls the precode, which triggers the
+            // fixup thunk → JIT → backpatch. MethodInfo.Invoke on the target method
+            // uses RuntimeMethodHandle.InvokeMethod which bypasses the precode,
+            // leaving it un-backpatched and causing crashes when we patch the
+            // PRESTUB address extracted from the fixup thunk.
+            EnsureJitCompiled(_targetMethod);
             IntPtr functionPointer = _targetMethod.MethodHandle.GetFunctionPointer();
             IntPtr functionPointer2 = _hookMethod.MethodHandle.GetFunctionPointer();
             hookDiagInfo.PrecodeAddr = functionPointer;
@@ -407,12 +452,30 @@ namespace DynamicHook
             // calling convention expected by the hook body.
             IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(functionPointer2);
             if (intPtr == IntPtr.Zero) intPtr = functionPointer2;
-            if (_needsGenericAdapter)
+            if (NeedsGenericAdapter())
             {
-                // CoreCLR: generic dictionary is in R10 (loaded by precode/callsite).
-                // User args are already in correct registers (RCX=this, RDX=arg1, ...).
-                hookDiagInfo.AdapterAddr = IntPtr.Zero;
-                hookDiagInfo.AdapterBytes = null;
+                // On x64, generic instance methods pass the generic dictionary in
+                // RDX (shifting user args to R8, R9, [stack]). Generic static
+                // methods pass it in RCX (shifting user args to RDX, R8, R9, [stack]).
+                // Build an adapter trampoline that shifts registers back to the
+                // standard managed calling convention before jumping to the hook.
+                // Without this, the hook receives the generic dictionary as its
+                // first user argument and the real arguments are shifted by one.
+                byte[] adapterBytes = BuildGenericAdapterBytes(_targetMethod.IsStatic, _targetMethod.GetParameters().Length);
+                if (adapterBytes.Length > 0)
+                {
+                    int trampSize = adapterBytes.Length + 12; // adapter + MOV RAX,imm64; JMP RAX
+                    _hookAdapterTrampoline = Memory.AllocExecNear(intPtr, trampSize);
+                    if (_hookAdapterTrampoline != IntPtr.Zero && _hookAdapterTrampoline != new IntPtr(-1))
+                    {
+                        MemOps.WriteBytes(_hookAdapterTrampoline, adapterBytes);
+                        byte[] jumpBytes = Jumper.BuildAbsJumpX64(intPtr);
+                        MemOps.WriteBytes(_hookAdapterTrampoline + adapterBytes.Length, jumpBytes);
+                        hookDiagInfo.AdapterAddr = _hookAdapterTrampoline;
+                        hookDiagInfo.AdapterBytes = adapterBytes;
+                        intPtr = _hookAdapterTrampoline; // all patches now jump to adapter → hook
+                    }
+                }
             }
             _newSlotValue = intPtr;
             hookDiagInfo.JumpTargetAddr = intPtr;
@@ -440,6 +503,138 @@ namespace DynamicHook
             }
             catch
             {
+            }
+        }
+
+        /// <summary>
+        /// Forces real JIT compilation of the target method AND backpatches the
+        /// precode by invoking the method once with dummy arguments.
+        ///
+        /// RuntimeHelpers.PrepareMethod may leave a PRESTUB (pre-JIT stub) for
+        /// generic methods on .NET Framework 4.x. The PRESTUB is replaced with
+        /// real JIT code on first actual call through the precode — the fixup
+        /// thunk runs, JIT compiles the method, updates the fixup code's
+        /// &lt;jit_addr&gt; field, and backpatches the precode.
+        ///
+        /// MethodInfo.Invoke on the target method uses
+        /// RuntimeMethodHandle.InvokeMethod which calls the JIT code directly,
+        /// bypassing the precode. This leaves the precode un-backpatched and the
+        /// fixup code's &lt;jit_addr&gt; still pointing to the PRESTUB. When we
+        /// later extract this address via TryResolveFixupToJitCode and patch it,
+        /// we corrupt the PRESTUB, causing AccessViolationException on call.
+        ///
+        /// Fix: invoke via the delegate's DynamicInvoke. DynamicInvoke calls the
+        /// delegate's Invoke method, which calls the precode, which triggers the
+        /// fixup thunk → JIT → backpatch. This ensures the fixup code's
+        /// &lt;jit_addr&gt; is updated to point to real JIT code before we patch it.
+        ///
+        /// Exceptions from the invocation are expected and harmless — JIT
+        /// compilation and backpatching occur before the method body executes.
+        /// </summary>
+        private void EnsureJitCompiled(MethodBase method)
+        {
+            if (!(method is MethodInfo mi)) return;
+            // Skip DynamicInvoke for generic methods on .NET Framework 4.x.
+            // DynamicInvoke goes through the precode → fixup thunk, which
+            // backpatches direct call sites to call JIT code directly.
+            // This bypasses our precode patch, and we can't find the JIT code
+            // to patch it (because <jit_addr> in the fixup thunk points to a
+            // data structure, not JIT code, on .NET Framework 4.x).
+            // By skipping DynamicInvoke, the call site remains un-backpatched
+            // and goes through the precode (which we patch), triggering the hook.
+            // PrepareMethod (called earlier) already JIT-compiles the method,
+            // so CallOriginal can still work via RestoreAll → delegate* Invoke
+            // → ReapplyAll (the fixup thunk handles JIT compilation on demand).
+            if (mi.IsGenericMethod && Environment.Version.Major < 6)
+            {
+                return;
+            }
+            try
+            {
+                ParameterInfo[] parameters = mi.GetParameters();
+                object[] methodArgs = new object[parameters.Length];
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    Type t = parameters[i].ParameterType;
+                    if (t.IsValueType)
+                    {
+                        methodArgs[i] = Activator.CreateInstance(t);
+                    }
+                    else
+                    {
+                        methodArgs[i] = null;
+                    }
+                }
+
+                // Build the args array for DynamicInvoke. For open instance
+                // delegates, the first arg is the instance.
+                object[] invokeArgs;
+                object instance = null;
+                if (!mi.IsStatic && mi.DeclaringType != null)
+                {
+                    Type declType = mi.DeclaringType;
+                    if (declType.IsGenericTypeDefinition)
+                    {
+                        Type[] typeArgs = mi.ReflectedType?.GetGenericArguments();
+                        if (typeArgs != null && typeArgs.Length > 0)
+                        {
+                            declType = declType.MakeGenericType(typeArgs);
+                        }
+                    }
+                    if (declType.IsValueType)
+                    {
+                        instance = Activator.CreateInstance(declType);
+                    }
+                    else if (!declType.IsAbstract)
+                    {
+                        try { instance = Activator.CreateInstance(declType); }
+                        catch { instance = FormatterServices.GetUninitializedObject(declType); }
+                    }
+                    else
+                    {
+                        instance = FormatterServices.GetUninitializedObject(declType);
+                    }
+
+                    invokeArgs = new object[methodArgs.Length + 1];
+                    invokeArgs[0] = instance;
+                    Array.Copy(methodArgs, 0, invokeArgs, 1, methodArgs.Length);
+                }
+                else
+                {
+                    invokeArgs = methodArgs;
+                }
+
+                // Prefer invoking via the delegate's DynamicInvoke, which calls
+                // the delegate's Invoke method → precode → fixup thunk → JIT →
+                // backpatch. This is critical on .NET Framework 4.x where
+                // MethodInfo.Invoke bypasses the precode.
+                bool invoked = false;
+                if (_originalDelegate != null)
+                {
+                    try
+                    {
+                        _originalDelegate.DynamicInvoke(invokeArgs);
+                        invoked = true;
+                    }
+                    catch
+                    {
+                        // Expected — dummy args cause exceptions in the method
+                        // body, but JIT compilation and backpatching occur first.
+                        invoked = true;
+                    }
+                }
+
+                if (!invoked)
+                {
+                    // Fallback: MethodInfo.Invoke (may not backpatch precode on
+                    // .NET Framework 4.x, but works on .NET 6+).
+                    mi.Invoke(instance, methodArgs);
+                }
+            }
+            catch
+            {
+                // JIT compilation/backpatching failures are non-fatal — the
+                // fixup thunk handles on-demand compilation at call time.
             }
         }
 
@@ -554,7 +749,7 @@ namespace DynamicHook
                 // entry-point fields — corrupting them breaks dispatch). The MethodTable
                 // scan (65536 bytes) may still overlap MethodDesc memory, so filter out
                 // any found slots that fall within the MethodDesc region afterwards.
-                IntPtr mdForScan = _needsGenericAdapter ? methodDesc : IntPtr.Zero;
+                IntPtr mdForScan = !_needsGenericAdapter ? methodDesc : IntPtr.Zero;
                 _slotAddresses = SlotPatcher.FindSlots(mdForScan, methodTable, targetPtr);
                 if (!_needsGenericAdapter && methodDesc != IntPtr.Zero)
                 {
@@ -578,13 +773,27 @@ namespace DynamicHook
                     diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictAddr=0x" + genDictAddr.ToInt64().ToString("X");
                     if (genDictAddr != IntPtr.Zero)
                     {
-                        IntPtr jitCode = MethodEntryResolver.ResolveRealEntry(targetPtr);
-                        List<IntPtr> dictSlots = SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, targetPtr);
-                        // Also scan for the JIT code address
-                        List<IntPtr> dictSlots2 = SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitCode);
-                        foreach (IntPtr s in dictSlots2)
+                        // Search for multiple possible code pointer values in the
+                        // generic dictionary:
+                        // 1. targetPtr (precode address) — what the slot initially holds
+                        // 2. ResolveRealEntry(targetPtr) — the fixup thunk address
+                        // 3. TryResolveFixupToJitCode(fixup thunk) — the <jit_addr>
+                        //    field, which may be PRESTUB (cold) or real JIT code (warm)
+                        // Generic dictionaries can be large (hundreds of slots), so
+                        // scan up to 8192 bytes.
+                        const int dictScanSize = 8192;
+                        IntPtr fixupThunk = MethodEntryResolver.ResolveRealEntry(targetPtr);
+                        var dictSlots = SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, targetPtr, dictScanSize);
+                        if (fixupThunk != IntPtr.Zero && fixupThunk != targetPtr)
                         {
-                            if (!dictSlots.Contains(s)) dictSlots.Add(s);
+                            foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, fixupThunk, dictScanSize))
+                                if (!dictSlots.Contains(s)) dictSlots.Add(s);
+                        }
+                        IntPtr jitFromFixup = TryResolveFixupToJitCode(fixupThunk);
+                        if (jitFromFixup != IntPtr.Zero && jitFromFixup != targetPtr && jitFromFixup != fixupThunk)
+                        {
+                            foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitFromFixup, dictScanSize))
+                                if (!dictSlots.Contains(s)) dictSlots.Add(s);
                         }
                         foreach (IntPtr s in dictSlots)
                         {
@@ -609,9 +818,17 @@ namespace DynamicHook
         }
 
         /// <summary>
-        /// 从 FixupPrecode 的第一个 FF 25 目标（fixup thunk）中提取泛型字典地址。
-        /// fixup thunk 格式: 49 89 D0 48 BA <dict> 48 B8 <code> FF E0
-        /// 泛型字典地址在偏移 5 处 (48 BA 的操作数)。
+        /// Extracts the generic dictionary address from the fixup thunk referenced
+        /// by a precode. Supports both FF 25 (indirect jump) and E9 (relative jump)
+        /// precode formats.
+        ///
+        /// FF 25 precode (.NET 6+ FixupPrecode): FF 25 <disp32> -> [mem] = fixup thunk addr
+        /// E9 precode (.NET Framework 4.x DirectJump): E9 <rel32> -> fixup thunk addr
+        ///
+        /// Fixup thunk format (instance methods):
+        ///   49 89 D0 | 48 BA <8-byte dict> | 48 B8 <8-byte jit_addr> | FF E0
+        ///   MOV R10, RDX; MOV RDX, dict; MOV RAX, jit_addr; JMP RAX
+        /// The generic dictionary address is at offset 5 (operand of 48 BA).
         /// </summary>
         private unsafe IntPtr ExtractGenericDictionaryFromFixup(IntPtr precodeAddr)
         {
@@ -619,12 +836,28 @@ namespace DynamicHook
             try
             {
                 byte* p = (byte*)precodeAddr;
-                if (p[0] != 0xFF || p[1] != 0x25) return IntPtr.Zero;
-                // Read first FF 25's target (the fixup thunk)
-                int disp = *(int*)(p + 2);
-                long fixupLoc = precodeAddr.ToInt64() + 6 + disp;
-                if (!Memory.IsReadable(new IntPtr(fixupLoc), 8)) return IntPtr.Zero;
-                long fixupAddr = *(long*)fixupLoc;
+                byte op = p[0];
+                long fixupAddr = 0;
+
+                if (op == 0xFF && p[1] == 0x25)
+                {
+                    // FF 25 precode: indirect jump through [rip+disp32]
+                    int disp = *(int*)(p + 2);
+                    long fixupLoc = precodeAddr.ToInt64() + 6 + disp;
+                    if (!Memory.IsReadable(new IntPtr(fixupLoc), 8)) return IntPtr.Zero;
+                    fixupAddr = *(long*)fixupLoc;
+                }
+                else if (op == 0xE9)
+                {
+                    // E9 precode (.NET Framework 4.x): relative jump to fixup thunk
+                    int rel32 = *(int*)(p + 1);
+                    fixupAddr = precodeAddr.ToInt64() + 5 + rel32;
+                }
+                else
+                {
+                    return IntPtr.Zero;
+                }
+
                 if (fixupAddr == 0) return IntPtr.Zero;
                 if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return IntPtr.Zero;
                 byte* f = (byte*)fixupAddr;
@@ -676,9 +909,9 @@ namespace DynamicHook
             byte* ptr = (byte*)targetPtr;
             byte b = *ptr;
             byte b2 = ptr[1];
-            if (b == byte.MaxValue && b2 == 37)
+            if (b == 0xFF && b2 == 0x25)
             {
-                bool flag = ptr[6] == 76 && ptr[7] == 139 && ptr[8] == 21 && ptr[13] == byte.MaxValue && ptr[14] == 37;
+                bool flag = ptr[6] == 0x4C && ptr[7] == 0x8B && ptr[8] == 0x15 && ptr[13] == 0xFF && ptr[14] == 0x25;
                 // Read first FF 25's indirect target for diagnostics
                 int disp1 = *(int*)(ptr + 2);
                 long target1Loc = targetPtr.ToInt64() + 6 + disp1;
@@ -749,6 +982,21 @@ namespace DynamicHook
                 else
                 {
                     // Non-generic: patch the FF 25's indirect target data pointer.
+                    // On .NET 6/8 with tiered compilation, call sites are backpatched
+                    // to call the JIT code directly, bypassing the precode. Install a
+                    // secondary JIT patch BEFORE patching the indirect target, otherwise
+                    // ResolveRealEntry would follow our patched pointer and resolve to
+                    // the hook address instead of the real JIT code.
+                    //
+                    // NOTE: Only install the secondary JIT patch for non-generic methods.
+                    // Generic methods in this else branch (flag=false) must NOT receive a
+                    // secondary JIT patch — the original behavior (precode-only patch)
+                    // works correctly for them, and patching JIT code causes AV crashes
+                    // on .NET 6/8 due to generic-dictionary setup in the JIT prologue.
+                    if (!_needsGenericAdapter)
+                    {
+                        InstallSecondaryJitPatch(targetPtr, jumpTarget, diag);
+                    }
                     int num = 0;  // Always patch the first FF 25 (the normal call entry)
                     byte* ptr2 = ptr + num;
                     int num2 = *(int*)(ptr2 + 2);
@@ -758,16 +1006,91 @@ namespace DynamicHook
                     _indirectTargetLoc = new IntPtr(num3);
                     _originalIndirectTarget = new IntPtr(*(long*)num3);
                     MemOps.WriteInt64Cell(_indirectTargetLoc, jumpTarget.ToInt64());
-                    diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode)" : "Indirect(FF 25)");
+                    diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode) + JIT(E9)" : "Indirect(FF 25) + JIT(E9)");
                     diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
                 }
             }
-            else if (b == 232 || b == 233)
+            else if (b == 0xE8 || b == 0xE9)
             {
-                // For generic methods, patch JIT code BEFORE patching precode.
-                // ResolveRealEntry must see the original precode to find the real JIT code.
-                if (_needsGenericAdapter)
+                // E8/E9 precode: the precode jumps to either the fixup thunk
+                // (generic methods on .NET Framework 4.x) or directly to JIT code
+                // (non-generic methods, or after backpatching on .NET 6+).
+                //
+                // For generic instance methods on .NET Framework 4.x, the E9 target
+                // is a fixup thunk: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0.
+                // The <jit_addr> field may point to a PRESTUB or data structure
+                // (not directly to JIT code), so patching the TARGET would corrupt
+                // it. Instead, we patch the <jit_addr> FIELD ITSELF (a data pointer
+                // at offset 15 in the fixup thunk) to point to the hook adapter.
+                // This redirects all calls through the fixup thunk to the hook.
+                //
+                // CRITICAL: After EnsureJitCompiled triggers JIT compilation via
+                // DynamicInvoke, the CLR backpatches direct call sites to call the
+                // JIT code directly (bypassing both the precode and fixup thunk).
+                // So we must ALSO patch the JIT code itself with a 5-byte E9 jump.
+                // We extract the JIT code address from <jit_addr> BEFORE patching
+                // it, then patch both: the <jit_addr> field (for fixup thunk path)
+                // and the JIT code (for backpatched call sites).
+                //
+                // For non-generic methods on .NET 6+, the E9 target is real JIT code.
+                // We patch it with a secondary 5-byte E9 jump (InstallSecondaryJitPatch).
+                if (_needsGenericAdapter && b == 0xE9)
                 {
+                    // For generic methods, call sites bypass the precode and call the
+                    // JIT code directly (via backpatching on .NET 6+, or via MethodDesc
+                    // on .NET Framework 4.x after PrepareMethod). We MUST patch both
+                    // the fixup thunk (target1) and the inner JIT code to redirect all
+                    // call paths to the hook.
+                    //
+                    // InstallTarget1Patch reads <jit_addr> from the fixup thunk,
+                    // resolves it to real JIT code (handling DATA structure indirection
+                    // on .NET Framework 4.x and chained precodes on .NET 8), and
+                    // patches both with 12-byte absolute jumps to the hook adapter.
+                    //
+                    // CRITICAL: Do NOT use ResolveRealEntry to get the fixup thunk
+                    // address — it follows the entire jump chain (including the
+                    // fixup thunk's MOV RAX, <jit_addr>; JMP RAX), returning the
+                    // <jit_addr> value instead of the fixup thunk address.
+                    IntPtr fixupThunk = ResolveFixupThunkFromPrecode(targetPtr);
+                    if (fixupThunk != IntPtr.Zero)
+                    {
+                        InstallTarget1Patch(fixupThunk, jumpTarget, diag);
+                    }
+                    else
+                    {
+                        // No fixup thunk pattern — the E9 target may be real JIT code
+                        // (e.g., Array.ConvertAll on .NET Framework 4.x where the
+                        // precode was backpatched to point directly to JIT code).
+                        // Resolve the real entry and patch the JIT code directly.
+                        IntPtr realJit = MethodEntryResolver.ResolveRealEntry(targetPtr);
+                        if (realJit != IntPtr.Zero && realJit != targetPtr && LooksLikeRealJitCode(realJit))
+                        {
+                            _innerCodeAddress = realJit;
+                            _innerCodeOriginalBytes = MemOps.ReadBytes(realJit, 12);
+                            _innerCodeOriginalBytesFull = MemOps.ReadBytesSafe(realJit, 32);
+                            byte[] innerPatch = Jumper.BuildAbsJumpX64(jumpTarget);
+                            MemOps.WriteBytesProtected(realJit, innerPatch);
+                            _hasInnerCodePatch = true;
+                            diag.PatchError += "; InnerCodePatch(12-byte, direct E9) at 0x" + realJit.ToInt64().ToString("X");
+                        }
+                        else
+                        {
+                            // Fallback: patch <jit_addr> field only (old behavior).
+                            TryPatchFixupThunkJitAddr(targetPtr, jumpTarget, diag);
+                        }
+                    }
+                    // Install a call-original trampoline using the inner code's
+                    // original prologue (set by InstallTarget1Patch). The trampoline
+                    // sets up R10 (generic dict), executes the relocated original
+                    // prologue, then JMPs past the 12-byte patch.
+                    if (_innerCodeAddress != IntPtr.Zero && _innerCodeOriginalBytesFull != null)
+                    {
+                        InstallCallOriginalTrampoline(_innerCodeAddress, _innerCodeOriginalBytesFull, diag, 12);
+                    }
+                }
+                else if (!_needsGenericAdapter && (Environment.Version.Major >= 6 || IsPrecodeBackpatched(targetPtr)))
+                {
+                    // Non-generic: patch the JIT code with a secondary 5-byte E9 jump.
                     InstallSecondaryJitPatch(targetPtr, jumpTarget, diag);
                 }
                 // E8/E9 precode: patch the precode itself with a 5-byte relative
@@ -787,7 +1110,7 @@ namespace DynamicHook
                 int value = (int)(_nearTrampoline.ToInt64() - (targetPtr.ToInt64() + 5));
                 byte[] array2 = Jumper.BuildRelJump(targetPtr, _nearTrampoline);
                 MemOps.WriteBytesProtected(targetPtr, array2);
-                diag.PatchType = ((b == 232) ? "FixupPrecode(E8->E9)" : "DirectJump(E9)");
+                diag.PatchType = ((b == 0xE8) ? "FixupPrecode(E8->E9)" : "DirectJump(E9)");
                 diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else if (!MethodEntryResolver.IsJump(targetPtr))
@@ -814,6 +1137,124 @@ namespace DynamicHook
                     diag.PatchType = "None(relies on slot replacement)";
                 }
             }
+        }
+
+        /// <summary>
+        /// Attempts to patch the &lt;jit_addr&gt; field in the fixup thunk referenced
+        /// by an E9 precode. The fixup thunk has the pattern:
+        ///   49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
+        /// We overwrite the &lt;jit_addr&gt; field (8 bytes at offset 15) to point to
+        /// the hook adapter trampoline. This is a DATA patch (not a code patch),
+        /// so it doesn't corrupt the PRESTUB or data structure that &lt;jit_addr&gt;
+        /// originally points to.
+        /// </summary>
+        /// <summary>
+        /// Computes the fixup thunk address from an E9 precode. Do NOT use
+        /// ResolveRealEntry for this — it follows the entire jump chain
+        /// (including the fixup thunk's MOV RAX, &lt;jit_addr&gt;; JMP RAX),
+        /// returning the &lt;jit_addr&gt; value instead of the fixup thunk address.
+        /// </summary>
+        private unsafe IntPtr ResolveFixupThunkFromPrecode(IntPtr precodeAddr)
+        {
+            if (!Memory.IsReadable(precodeAddr, 5)) return IntPtr.Zero;
+            try
+            {
+                byte* p = (byte*)precodeAddr;
+                if (p[0] != 0xE9) return IntPtr.Zero;
+                int rel32 = *(int*)(p + 1);
+                long fixupAddr = precodeAddr.ToInt64() + 5 + rel32;
+                if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return IntPtr.Zero;
+                // Verify fixup thunk pattern: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
+                byte* f = (byte*)fixupAddr;
+                if (f[0] != 0x49 || f[1] != 0x89 || f[2] != 0xD0) return IntPtr.Zero;
+                if (f[3] != 0x48 || f[4] != 0xBA) return IntPtr.Zero;
+                if (f[13] != 0x48 || f[14] != 0xB8) return IntPtr.Zero;
+                return new IntPtr(fixupAddr);
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        private unsafe bool TryPatchFixupThunkJitAddr(IntPtr precodeAddr, IntPtr jumpTarget, HookDiagInfo diag)
+        {
+            if (!Memory.IsReadable(precodeAddr, 5)) return false;
+            try
+            {
+                byte* p = (byte*)precodeAddr;
+                if (p[0] != 0xE9) return false;
+                int rel32 = *(int*)(p + 1);
+                long fixupAddr = precodeAddr.ToInt64() + 5 + rel32;
+                if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return false;
+                byte* f = (byte*)fixupAddr;
+                // Check fixup thunk pattern: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
+                if (f[0] != 0x49 || f[1] != 0x89 || f[2] != 0xD0) return false;
+                if (f[3] != 0x48 || f[4] != 0xBA) return false;
+                if (f[13] != 0x48 || f[14] != 0xB8) return false;
+                // The <jit_addr> is at offset 15 (operand of MOV RAX, imm64)
+                _fixupJitAddrLoc = new IntPtr(fixupAddr + 15);
+                _fixupJitAddrOriginal = new IntPtr(*(long*)(f + 15));
+                MemOps.WriteInt64Cell(_fixupJitAddrLoc, jumpTarget.ToInt64());
+                _hasFixupJitAddrPatch = true;
+                diag.PatchError += "; FixupThunk <jit_addr> patched at 0x" + _fixupJitAddrLoc.ToInt64().ToString("X") + " (orig=0x" + _fixupJitAddrOriginal.ToInt64().ToString("X") + ")";
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Checks whether the E8/E9 precode at <paramref name="precodeAddr"/> has been
+        /// backpatched to point directly to JIT code, or still points to the fixup
+        /// thunk (PRESTUB path).
+        ///
+        /// On .NET Framework 4.x, the precode initially has E9 → fixup thunk. After
+        /// the method is called through the precode (first call), the fixup thunk
+        /// JIT compiles the method and backpatches the precode to E9 → JIT code.
+        ///
+        /// If the precode has NOT been backpatched, TryResolveFixupToJitCode would
+        /// extract &lt;jit_addr&gt; from the fixup thunk, which may point to a PRESTUB
+        /// or data structure rather than real JIT code. Patching this address
+        /// corrupts it, causing AccessViolationException.
+        /// </summary>
+        private unsafe bool IsPrecodeBackpatched(IntPtr precodeAddr)
+        {
+            if (!Memory.IsReadable(precodeAddr, 5)) return true; // assume backpatched
+            byte* p = (byte*)precodeAddr;
+            byte op = p[0];
+            // Only E8/E9 precodes go through the fixup thunk. Other formats
+            // (FF 25, etc.) are handled by different code paths.
+            if (op != 0xE9 && op != 0xE8) return true;
+            int rel32 = *(int*)(p + 1);
+            long target = precodeAddr.ToInt64() + 5 + rel32;
+            if (!Memory.IsReadable(new IntPtr(target), 23)) return true;
+            byte* t = (byte*)target;
+            // The fixup thunk pattern starts with: 49 89 D0 48 BA (MOV R10, RDX; MOV RDX, ...)
+            // If the target has this pattern, the precode still points to the fixup
+            // thunk. On .NET Framework 4.x, the precode ALWAYS points to the fixup
+            // thunk for generic methods — the fixup thunk's <jit_addr> field is what
+            // gets updated (not the precode's E9 target). So we check <jit_addr> to
+            // determine if the method has been JIT compiled.
+            if (t[0] == 0x49 && t[1] == 0x89 && t[2] == 0xD0 && t[3] == 0x48 && t[4] == 0xBA)
+            {
+                // Extract <jit_addr> from the fixup thunk (offset 15, after 48 B8 at offset 13)
+                if (t[13] == 0x48 && t[14] == 0xB8)
+                {
+                    long jitAddr = *(long*)(t + 15);
+                    if (jitAddr != 0 && Memory.IsReadable(new IntPtr(jitAddr), 16))
+                    {
+                        byte* jitBytes = (byte*)jitAddr;
+                        // A PRESTUB is typically a very short stub (5-10 bytes) that
+                        // calls the JIT compiler. Real JIT code starts with a function
+                        // prologue. Heuristic: if the first byte is E8 (call) and the
+                        // 6th byte is E9 (jmp), it's likely a PRESTUB.
+                        bool looksLikePrestub = jitBytes[0] == 0xE8 && jitBytes[5] == 0xE9;
+                        return !looksLikePrestub;
+                    }
+                }
+                return false; // can't read jit_addr → assume not backpatched (safe)
+            }
+            return true; // no fixup pattern → backpatched (points to JIT code)
         }
 
         private void InstallSecondaryJitPatch(IntPtr targetPtr, IntPtr jumpTarget, HookDiagInfo diag)
@@ -897,6 +1338,63 @@ namespace DynamicHook
         }
 
         /// <summary>
+        /// Checks whether the bytes at <paramref name="addr"/> look like real JIT
+        /// code (function prologue) rather than a PRESTUB or data structure.
+        ///
+        /// A PRESTUB on .NET Framework 4.x typically starts with E8 (CALL) followed
+        /// by E9 (JMP) at byte 5. Real JIT code starts with a function prologue:
+        /// push reg (50-57), sub rsp (48 83 EC), mov [rsp+xx], reg (48 89 .. 24),
+        /// or similar. Data structures (e.g. MethodDesc pointers) have arbitrary
+        /// byte patterns that typically don't match a prologue.
+        ///
+        /// This is used to decide whether to patch the address directly with a
+        /// 5-byte E9 jump. Patching a PRESTUB or data structure would corrupt it
+        /// and cause AccessViolationException.
+        /// </summary>
+        private unsafe bool LooksLikeRealJitCode(IntPtr addr)
+        {
+            if (addr == IntPtr.Zero) return false;
+            if (!Memory.IsReadable(addr, 16)) return false;
+            try
+            {
+                byte* p = (byte*)addr;
+                byte b0 = p[0];
+                byte b1 = p[1];
+                // PRESTUB pattern: E8 <rel32> E9 <rel32> (call helper, then jmp)
+                if (b0 == 0xE8 && p[5] == 0xE9) return false;
+                // Another PRESTUB variant: starts with E8 or E9 (call/jmp to helper)
+                if (b0 == 0xE8 || b0 == 0xE9) return false;
+                // Common x64 function prologues:
+                // 48 83 EC xx     SUB RSP, imm8
+                // 48 81 EC xx..   SUB RSP, imm32
+                // 48 89 5C 24 xx  MOV [RSP+xx], RBX
+                // 4C 8B DC        MOV R11, RSP
+                // 41 57           PUSH R15 (REX.B + 0x57)
+                // 41 56           PUSH R14 (REX.B + 0x56)
+                // All REX prefixes (0x40-0x4F) can start a function prologue.
+                if (b0 >= 0x40 && b0 <= 0x4F) return true;  // REX prefix
+                // PUSH reg (50-57): only valid as prologue if followed by another
+                // PUSH or a REX prefix. A lone 50 followed by a non-prologue byte
+                // is likely a DATA structure (e.g. pointer starting with 0x50).
+                if (b0 >= 0x50 && b0 <= 0x57)
+                {
+                    if (b1 >= 0x50 && b1 <= 0x57) return true;  // another PUSH
+                    if (b1 == 0x48 || b1 == 0x4C) return true;  // REX prefix
+                    if (b1 == 0x40) return true;                 // REX prefix
+                    return false;  // likely DATA structure
+                }
+                // Some JIT code starts with MOV or LEA
+                if (b0 == 0x8B || b0 == 0x8D) return true;
+                // If not recognized, be conservative — don't patch
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Detects the .NET Framework x86 generic method fixup code pattern and
         /// extracts the real JIT code address from it. The fixup code typically
         /// loads the generic dictionary (via MOV EDX/B8 or similar) then:
@@ -929,6 +1427,108 @@ namespace DynamicHook
             }
         }
 
+        /// <summary>
+        /// On .NET Framework 4.x x64, generic methods pass the generic dictionary
+        /// in RDX (instance) or RCX (static), shifting user arguments one register
+        /// position to the right. When a direct call site hits the secondary JIT
+        /// patch and is redirected to the hook (non-generic, standard convention),
+        /// the hook receives the generic dictionary pointer as its first user
+        /// parameter — corrupting the call and causing AccessViolationException.
+        ///
+        /// An adapter trampoline is needed to shift registers from the generic
+        /// calling convention back to the standard convention before jumping to
+        /// the hook. On BOTH .NET Framework 4.x and .NET 6+ x64, generic methods
+        /// pass the generic dictionary in RDX (instance) or RCX (static), which
+        /// shifts user arguments to R8/R9/[stack]. Without this adapter, the hook
+        /// receives the generic dictionary pointer as its first user argument
+        /// instead of the real argument, causing parameter capture failures.
+        /// (The precode on .NET 6+ also sets R10 via `49 BA`, but RDX still
+        /// carries the generic dictionary at JIT entry, so the adapter is needed.)
+        /// </summary>
+        private bool NeedsGenericAdapter()
+        {
+            return Platform.Current == Platform.Arch.X64
+                && _needsGenericAdapter;
+        }
+
+        /// <summary>
+        /// Builds x64 register-shift code that converts from the .NET Framework 4.x
+        /// generic calling convention to the standard managed calling convention.
+        ///
+        /// Instance method: RCX=this (kept), RDX=genericDict (discarded),
+        ///   R8=arg1, R9=arg2, [stack]=arg3 → RCX=this, RDX=arg1, R8=arg2, R9=arg3
+        /// Static method: RCX=genericDict (discarded), RDX=arg1, R8=arg2,
+        ///   R9=arg3, [stack]=arg4 → RCX=arg1, RDX=arg2, R8=arg3, R9=arg4
+        /// </summary>
+        private static byte[] BuildGenericAdapterBytes(bool isStatic, int userParamCount)
+        {
+            var bytes = new List<byte>();
+            if (isStatic)
+            {
+                // Generic dict is in RCX; shift user args left: RCX←RDX, RDX←R8, R8←R9
+                if (userParamCount >= 1)
+                    bytes.AddRange(new byte[] { 0x48, 0x89, 0xD1 });       // MOV RCX, RDX
+                if (userParamCount >= 2)
+                    bytes.AddRange(new byte[] { 0x4C, 0x89, 0xC2 });       // MOV RDX, R8
+                if (userParamCount >= 3)
+                    bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC8 });       // MOV R8, R9
+                if (userParamCount >= 4)
+                    bytes.AddRange(new byte[] { 0x4C, 0x8B, 0x4C, 0x24, 0x28 }); // MOV R9, [RSP+0x28]
+            }
+            else
+            {
+                // Generic dict is in RDX (this stays in RCX); shift: RDX←R8, R8←R9
+                if (userParamCount >= 1)
+                    bytes.AddRange(new byte[] { 0x4C, 0x89, 0xC2 });       // MOV RDX, R8
+                if (userParamCount >= 2)
+                    bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC8 });       // MOV R8, R9
+                if (userParamCount >= 3)
+                    bytes.AddRange(new byte[] { 0x4C, 0x8B, 0x4C, 0x24, 0x28 }); // MOV R9, [RSP+0x28]
+            }
+            return bytes.ToArray();
+        }
+
+        /// <summary>
+        /// Builds x64 register-shift code that converts from the STANDARD managed
+        /// calling convention to the GENERIC calling convention (reverse of
+        /// BuildGenericAdapterBytes). This is needed by the call-original trampoline
+        /// because delegate*/Marshal.GetDelegateForFunctionPointer passes args in
+        /// standard convention (RCX, RDX, R8, R9), but the original JIT code for
+        /// generic methods expects them in generic convention.
+        ///
+        /// Instance method: RCX=this, RDX=arg1, R8=arg2, R9=arg3
+        ///   → RCX=this, RDX=genericDict, R8=arg1, R9=arg2, [stack]=arg3
+        /// Static method: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
+        ///   → RCX=genericDict, RDX=arg0, R8=arg1, R9=arg2, [stack]=arg3
+        ///
+        /// R10 must already be set to genericDict before this code runs.
+        /// The shift goes right-to-left (last arg first) to avoid overwriting.
+        /// </summary>
+        private static byte[] BuildReverseGenericAdapterBytes(bool isStatic, int userParamCount)
+        {
+            var bytes = new List<byte>();
+            // Shift right by 1, starting from the last arg to avoid overwriting.
+            if (userParamCount >= 3)
+                bytes.AddRange(new byte[] { 0x4C, 0x89, 0x4C, 0x24, 0x28 }); // MOV [RSP+0x28], R9
+            if (userParamCount >= 2)
+                bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC1 });       // MOV R9, R8
+            if (userParamCount >= 1)
+                bytes.AddRange(new byte[] { 0x49, 0x89, 0xD0 });       // MOV R8, RDX
+            if (isStatic)
+            {
+                // For static: shift RCX (arg0) to RDX, then set RCX = R10 (genericDict)
+                if (userParamCount >= 1)
+                    bytes.AddRange(new byte[] { 0x48, 0x89, 0xCA });   // MOV RDX, RCX
+                bytes.AddRange(new byte[] { 0x4C, 0x89, 0xD1 });       // MOV RCX, R10
+            }
+            else
+            {
+                // For instance: set RDX = R10 (genericDict)
+                bytes.AddRange(new byte[] { 0x4C, 0x89, 0xD2 });       // MOV RDX, R10
+            }
+            return bytes.ToArray();
+        }
+
         private void InstallSecondaryJitPatchAt(IntPtr intPtr, IntPtr jumpTarget, HookDiagInfo diag)
         {
             try
@@ -940,19 +1540,24 @@ namespace DynamicHook
                 }
                 diag.JitCodeAddr = intPtr;
                 diag.JitCodeOriginalBytes = MemOps.ReadBytesSafe(intPtr, 32);
+                // Save the full 32-byte copy BEFORE the 5-byte E9 patch is applied.
+                // Used by the call-original trampoline to copy/relocate the prologue.
+                _secondaryJitOriginalBytesFull = diag.JitCodeOriginalBytes;
 
-                // Use a 5-byte relative jump (E9) with a near trampoline instead of a 12-byte
-                // absolute jump. This overwrites only 5 bytes of the prologue, minimizing GC
-                // info corruption. The trampoline is allocated within 2GB of the patch site.
-                IntPtr trampoline = Memory.AllocExecNear(intPtr, 12);
+                // The adapter (register shift for generic calling convention) is now
+                // built once in Install() and included in jumpTarget. This trampoline
+                // just needs to jump to jumpTarget.
+                int trampolineSize = 12; // MOV RAX,imm64; JMP RAX
+
+                IntPtr trampoline = Memory.AllocExecNear(intPtr, trampolineSize);
                 if (trampoline == IntPtr.Zero || trampoline == new IntPtr(-1))
                 {
                     diag.PatchError += "; failed to allocate near trampoline for JIT patch";
                     return;
                 }
-                // Trampoline: MOV RAX, jumpTarget; JMP RAX (12 bytes)
-                byte[] trampBytes = Jumper.BuildAbsJumpX64(jumpTarget);
-                MemOps.WriteBytes(trampoline, trampBytes);
+                // Trampoline: MOV RAX, jumpTarget; JMP RAX
+                byte[] jumpBytes = Jumper.BuildAbsJumpX64(jumpTarget);
+                MemOps.WriteBytes(trampoline, jumpBytes);
 
                 // Patch JIT code with 5-byte relative jump to trampoline
                 _secondaryJitAddress = intPtr;
@@ -1083,14 +1688,23 @@ namespace DynamicHook
             if (target1Addr == IntPtr.Zero) return;
             try
             {
-                // Read the fixup code to extract the inner code address
+                // Read the fixup code to extract the inner code address.
+                // The fixup thunk pattern is: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> ...
+                // On .NET 8, it ends with FF E0 (JMP RAX). On .NET Framework 4.x,
+                // it may have additional instructions after <jit_addr> (e.g. 48 8B ...).
+                // We only require the prefix pattern (49 89 D0 48 BA ... 48 B8) to
+                // extract <jit_addr> at offset 15.
                 byte[] fixupBytes = MemOps.ReadBytesSafe(target1Addr, 25);
                 IntPtr innerCodeAddr = IntPtr.Zero;
-                if (fixupBytes != null && fixupBytes.Length >= 25 &&
+                bool patternMatch = fixupBytes != null && fixupBytes.Length >= 23 &&
                     fixupBytes[0] == 0x49 && fixupBytes[1] == 0x89 && fixupBytes[2] == 0xD0 &&
                     fixupBytes[3] == 0x48 && fixupBytes[4] == 0xBA &&
-                    fixupBytes[13] == 0x48 && fixupBytes[14] == 0xB8 &&
-                    fixupBytes[23] == 0xFF && fixupBytes[24] == 0xE0)
+                    fixupBytes[13] == 0x48 && fixupBytes[14] == 0xB8;
+                if (!patternMatch && fixupBytes != null)
+                {
+                    diag.PatchError += "; FixupThunk bytes: " + BitConverter.ToString(fixupBytes) + " (pattern mismatch)";
+                }
+                if (patternMatch)
                 {
                     long innerAddr = BitConverter.ToInt64(fixupBytes, 15);
                     if (innerAddr != 0)
@@ -1108,6 +1722,28 @@ namespace DynamicHook
                         {
                             diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; ResolvedInner->RealJit 0x" + realJit.ToInt64().ToString("X");
                             innerCodeAddr = realJit;
+                        }
+                        // On .NET Framework 4.x, <jit_addr> may point to a DATA
+                        // structure (8-byte pointer to JIT code) rather than JIT
+                        // code directly. If the resolved address doesn't look like
+                        // JIT code, try dereferencing it (read the first 8 bytes as
+                        // a pointer to the real JIT code).
+                        if (!LooksLikeRealJitCode(innerCodeAddr))
+                        {
+                            try
+                            {
+                                if (Memory.IsReadable(innerCodeAddr, 8))
+                                {
+                                    long deref = Marshal.ReadInt64(innerCodeAddr);
+                                    IntPtr derefPtr = new IntPtr(deref);
+                                    if (deref != 0 && LooksLikeRealJitCode(derefPtr))
+                                    {
+                                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; DerefData->Jit 0x" + deref.ToString("X");
+                                        innerCodeAddr = derefPtr;
+                                    }
+                                }
+                            }
+                            catch { }
                         }
                     }
                 }
@@ -1131,9 +1767,12 @@ namespace DynamicHook
                     try
                     {
                         byte[] innerBytes = MemOps.ReadBytesSafe(innerCodeAddr, 16);
-                        // Only patch if it looks like code (not already patched)
+                        // Only patch if it looks like JIT code (not already patched,
+                        // and not a DATA structure). On .NET Framework 4.x, <jit_addr>
+                        // may point to a DATA structure — patching it corrupts memory.
                         if (innerBytes != null && innerBytes.Length >= 12 &&
-                            (innerBytes[0] != 0x48 || innerBytes[1] != 0xB8))
+                            (innerBytes[0] != 0x48 || innerBytes[1] != 0xB8) &&
+                            LooksLikeRealJitCode(innerCodeAddr))
                         {
                             _innerCodeAddress = innerCodeAddr;
                             _innerCodeOriginalBytes = MemOps.ReadBytes(innerCodeAddr, 12);
@@ -1226,14 +1865,23 @@ namespace DynamicHook
                     genericDict = ExtractGenericDictionary(_precodeAddr);
                     if (genericDict == IntPtr.Zero)
                     {
+                        // Try .NET 6+ E9 precode pattern: 49 BA <dict> at offset 16
+                        genericDict = TryExtractGenericDictFromE9Precode(_precodeAddr);
+                    }
+                    if (genericDict == IntPtr.Zero)
+                    {
                         // Try .NET Framework 4.x fixup code pattern
                         genericDict = TryExtractGenericDictFromFixupCode(jitCodeAddr);
                     }
                     if (genericDict == IntPtr.Zero)
                     {
-                        diag.CallOrigStatus = "Failed to extract generic dictionary";
-                        return;
+                        // Try following the original E9 jump to the fixup code
+                        // (the precode is now patched, so use _originalBytes for the rel32)
+                        genericDict = TryExtractGenericDictFromOriginalPrecode();
                     }
+                    // If still not found, install the trampoline without R10 setup.
+                    // Some JIT-compiled methods may not use the generic dictionary at
+                    // all (type info inlined), so this is a best-effort fallback.
                 }
 
                 // Compute prologue copy length: must cover the patch and
@@ -1246,12 +1894,24 @@ namespace DynamicHook
                     return;
                 }
 
+                // Build the arg-shift code (standard → generic calling convention).
+                // delegate*/Marshal.GetDelegateForFunctionPointer passes args in
+                // standard convention (RCX, RDX, R8, R9), but the original JIT code
+                // for generic methods expects them in generic convention (dict in
+                // RDX for instance, RCX for static; user args shifted right by 1).
+                // R10 must be set to genericDict BEFORE the arg-shift code runs,
+                // because the arg-shift code copies R10 into RDX (instance) or RCX (static).
+                byte[] argShift = (_needsGenericAdapter && genericDict != IntPtr.Zero)
+                    ? BuildReverseGenericAdapterBytes(_targetMethod.IsStatic, _targetMethod.GetParameters().Length)
+                    : Array.Empty<byte>();
+
                 // Build the trampoline:
                 // [MOV R10, genericDict]?  (10 bytes, generic only)
+                // [arg-shift code]?        (variable, generic only: standard→generic)
                 // [copied prologue]        (copyLen bytes, RIP-relative relocated)
                 // [MOV RAX, jit+copyLen]   (10 bytes)
                 // [JMP RAX]                (2 bytes)
-                int prefixLen = _needsGenericAdapter ? 10 : 0;
+                int prefixLen = (_needsGenericAdapter && genericDict != IntPtr.Zero) ? 10 + argShift.Length : 0;
                 int trampSize = prefixLen + copyLen + 12;
                 _callOrigTrampSize = trampSize;
 
@@ -1265,13 +1925,18 @@ namespace DynamicHook
                 byte[] trampBytes = new byte[trampSize];
                 int offset = 0;
 
-                if (_needsGenericAdapter)
+                if (_needsGenericAdapter && genericDict != IntPtr.Zero)
                 {
                     // MOV R10, imm64: 49 BA <8 bytes>
                     trampBytes[0] = 0x49;
                     trampBytes[1] = 0xBA;
                     BitConverter.GetBytes(genericDict.ToInt64()).CopyTo(trampBytes, 2);
                     offset = 10;
+
+                    // Arg-shift code: convert standard convention → generic convention.
+                    // Must come AFTER MOV R10 (arg-shift reads R10 to set RDX/RCX).
+                    Buffer.BlockCopy(argShift, 0, trampBytes, offset, argShift.Length);
+                    offset += argShift.Length;
                 }
 
                 // Copy the original prologue bytes into the trampoline.
@@ -1285,20 +1950,25 @@ namespace DynamicHook
                 RelocateRipRelative(trampBytes, offset, copyLen, jitCodeAddr, copyDestAddr);
                 offset += copyLen;
 
-                // MOV RAX, jitCodeAddr + copyLen: 48 B8 <8 bytes>; JMP RAX: FF E0
-                trampBytes[offset] = 0x48;
-                trampBytes[offset + 1] = 0xB8;
-                BitConverter.GetBytes(jitCodeAddr.ToInt64() + copyLen).CopyTo(trampBytes, offset + 2);
-                trampBytes[offset + 10] = 0xFF;
-                trampBytes[offset + 11] = 0xE0;
+                // MOV RAX, jitCodeAddr + copyLen; JMP RAX (12-byte absolute jump)
+                byte[] tailJump = Jumper.BuildAbsJumpX64(new IntPtr(jitCodeAddr.ToInt64() + copyLen));
+                Buffer.BlockCopy(tailJump, 0, trampBytes, offset, tailJump.Length);
 
                 MemOps.WriteBytes(tramp, trampBytes);
 
+                // Register the trampoline as a valid CFG indirect-call target.
+                // delegate* (calli) is an indirect call, and .NET 6+ coreclr is built
+                // with CFG enabled — without this registration the calli to the
+                // trampoline raises STATUS_ACCESS_VIOLATION (0xC0000005).
+                Memory.RegisterValidCallTarget(tramp, trampSize);
+
                 _callOrigTrampoline = tramp;
+                diag.CallOrigTrampolineBytes = trampBytes;
                 diag.CallOrigStatus = "CopyPrologueTramp at 0x" + tramp.ToInt64().ToString("X") +
                     " (jitCode=0x" + jitCodeAddr.ToInt64().ToString("X") +
                     ", copyLen=" + copyLen +
-                    (_needsGenericAdapter ? ", genDict=0x" + genericDict.ToInt64().ToString("X") : "") + ")";
+                    (_needsGenericAdapter ? ", genDict=0x" + genericDict.ToInt64().ToString("X") +
+                        ", argShift=" + argShift.Length + "B" : "") + ")";
             }
             catch (Exception ex)
             {
@@ -1322,6 +1992,9 @@ namespace DynamicHook
             // We need to find it by scanning backwards from jitCodeAddr, or by
             // re-resolving from the precode. Instead, we scan the precode area.
             if (_precodeAddr == IntPtr.Zero) return IntPtr.Zero;
+            // On .NET Framework 4.x, AccessViolationException is uncatchable by
+            // default, so all pointer dereferences must be guarded by IsReadable.
+            if (!Memory.IsReadable(_precodeAddr, 6)) return IntPtr.Zero;
             try
             {
                 byte* p = (byte*)_precodeAddr;
@@ -1330,6 +2003,7 @@ namespace DynamicHook
                 {
                     int rel32 = *(int*)(p + 1);
                     long fixupAddr = _precodeAddr.ToInt64() + 5 + rel32;
+                    if (!Memory.IsReadable(new IntPtr(fixupAddr), 13)) return IntPtr.Zero;
                     byte* fp = (byte*)fixupAddr;
                     // Check for 49 89 D0 48 BA pattern
                     if (fp[0] == 0x49 && fp[1] == 0x89 && fp[2] == 0xD0 &&
@@ -1342,6 +2016,93 @@ namespace DynamicHook
                 }
                 // If precode is FF 25 (CoreCLR FixupPrecode), ExtractGenericDictionary
                 // should have already handled it. But try the fixup code path anyway.
+            }
+            catch
+            {
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Tries to extract the generic dictionary from a .NET 6+ E9 (DirectJump)
+        /// precode. The precode layout is:
+        ///   E9 rel32                ; JMP rel32 (to fixup/warmup code)
+        ///   5F                      ; POP RDI (precode sentinel)
+        ///   <8-byte target1 ptr>    ; at offset 6
+        ///   49 BA <8-byte dict>     ; MOV R10, imm64 (generic dictionary) at offset 16
+        /// The dictionary value is the 8-byte operand of MOV R10 (49 BA) at offset 18.
+        /// On .NET 6+, the JIT prologue expects R10 to already contain the generic
+        /// dictionary, which is set up by this MOV R10 instruction in the precode.
+        /// </summary>
+        private unsafe IntPtr TryExtractGenericDictFromE9Precode(IntPtr precodeAddr)
+        {
+            if (precodeAddr == IntPtr.Zero) return IntPtr.Zero;
+            if (!Memory.IsReadable(precodeAddr, 26)) return IntPtr.Zero;
+            try
+            {
+                byte* p = (byte*)precodeAddr;
+                // Must be E9 precode
+                if (p[0] != 0xE9) return IntPtr.Zero;
+                // Check for 49 BA (MOV R10, imm64) at offset 16
+                if (p[16] != 0x49 || p[17] != 0xBA) return IntPtr.Zero;
+                long dict = *(long*)(p + 18);
+                if (dict == 0) return IntPtr.Zero;
+                return new IntPtr(dict);
+            }
+            catch
+            {
+                return IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
+        /// Tries to extract the generic dictionary by following the ORIGINAL E9 jump
+        /// (from saved _originalBytes) to the fixup code, then scanning for the
+        /// MOV R10, imm64 (49 BA) pattern. This handles .NET 6+ precodes where the
+        /// generic dictionary is set up in the fixup code rather than inline in the
+        /// precode.
+        /// </summary>
+        private unsafe IntPtr TryExtractGenericDictFromOriginalPrecode()
+        {
+            if (_precodeAddr == IntPtr.Zero) return IntPtr.Zero;
+            if (_originalBytes == null || _originalBytes.Length < 5) return IntPtr.Zero;
+            if (_originalBytes[0] != 0xE9) return IntPtr.Zero;
+            try
+            {
+                int rel32 = BitConverter.ToInt32(_originalBytes, 1);
+                long fixupAddr = _precodeAddr.ToInt64() + 5 + rel32;
+                if (!Memory.IsReadable(new IntPtr(fixupAddr), 64)) return IntPtr.Zero;
+                byte* fp = (byte*)fixupAddr;
+                // Scan up to 64 bytes for 49 BA (MOV R10, imm64) pattern
+                for (int i = 0; i < 54; i++)
+                {
+                    if (fp[i] == 0x49 && fp[i + 1] == 0xBA)
+                    {
+                        long dict = *(long*)(fp + i + 2);
+                        if (dict != 0) return new IntPtr(dict);
+                    }
+                }
+                // Also try following any E9 rel32 in the fixup code (nested jump)
+                for (int i = 0; i < 59; i++)
+                {
+                    if (fp[i] == 0xE9)
+                    {
+                        int innerRel = *(int*)(fp + i + 1);
+                        long innerAddr = fixupAddr + i + 5 + innerRel;
+                        if (Memory.IsReadable(new IntPtr(innerAddr), 24))
+                        {
+                            byte* ip = (byte*)innerAddr;
+                            for (int j = 0; j < 14; j++)
+                            {
+                                if (ip[j] == 0x49 && ip[j + 1] == 0xBA)
+                                {
+                                    long dict = *(long*)(ip + j + 2);
+                                    if (dict != 0) return new IntPtr(dict);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             catch
             {
@@ -1384,6 +2145,12 @@ namespace DynamicHook
             int idx = hasRex ? 1 : 0;
             if (offset + idx >= code.Length) return 0;
             byte op = code[offset + idx];
+
+            // REX + push r64 / pop r64 (50-5F): 2 bytes total
+            if (op >= 0x50 && op <= 0x5F) return idx + 1;
+
+            // REX + MOV RAX..R15, imm64 (B8-BF): 2 + 8 = 10 bytes total
+            if (op >= 0xB8 && op <= 0xBF) return idx + 9;
 
             // 83: sub/add/cmp r/m, imm8
             if (op == 0x83)
@@ -1543,18 +2310,23 @@ namespace DynamicHook
             byte* ptr = (byte*)targetPtr;
             byte b = *ptr;
             byte b2 = ptr[1];
-            if (b == byte.MaxValue && b2 == 37)
+            if (b == 0xFF && b2 == 0x25)
             {
                 int num = *(int*)(ptr + 2);
                 _patchType = 1;
                 _patchAddress = targetPtr;
                 _indirectTargetLoc = new IntPtr(num);
+                if (!Memory.IsReadable(new IntPtr(num), 4))
+                {
+                    diag.PatchError += "; FF 25 indirect target not readable x86";
+                    return;
+                }
                 _originalIndirectTarget = new IntPtr(*(int*)num);
                 MemOps.WriteInt32Cell(_indirectTargetLoc, jumpTarget.ToInt32());
                 diag.PatchType = "Indirect(FF 25) x86";
                 diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
-            else if (b == 232 || b == 233)
+            else if (b == 0xE8 || b == 0xE9)
             {
                 // For generic methods, patch the JIT code BEFORE patching the
                 // precode. Direct calls to generic methods go through the generic
@@ -1568,7 +2340,7 @@ namespace DynamicHook
                 _originalBytes = MemOps.ReadBytes(targetPtr, 5);
                 byte[] array = Jumper.BuildJump(targetPtr, jumpTarget);
                 MemOps.WriteBytesProtected(targetPtr, array);
-                diag.PatchType = ((b == 232) ? "FixupPrecode(E8->E9) x86" : "DirectJump(E9) x86");
+                diag.PatchType = ((b == 0xE8) ? "FixupPrecode(E8->E9) x86" : "DirectJump(E9) x86");
                 diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
             }
             else if (b == 0xB8)
@@ -1659,34 +2431,76 @@ namespace DynamicHook
                 throw new NotSupportedException("CallOriginal supports at most 4 arguments; actual: " + argCount);
             }
 
-            // Path 0: for generic methods, use RestoreAll + MethodInfo.Invoke on a
-            // clean thread + ReapplyAll. The trampoline (delegate*) approach crashes
-            // because delegate* does not GC-track object references held in registers
-            // during execution - when the method allocates (e.g. ConvertAll creates a
-            // new List<TOutput>), GC may move objects and invalidate the raw references,
-            // causing NullReferenceException. MethodInfo.Invoke properly tracks GC roots.
-            // Running on a clean thread avoids re-entrancy (hook would re-trigger).
+            // Path 0b (call-original trampoline) is DISABLED.
+            // The trampoline is native code (VirtualAlloc) that sits between two
+            // managed frames. When a GC occurs inside the original method (e.g.
+            // ConvertAll allocates a List), the GC cannot walk through the native
+            // trampoline frame — it has no GC info, no method table entry, and the
+            // return address points to unmanaged code. This causes the GC to miss
+            // object references or crash with AccessViolationException.
+            // Instead, use Path 0 (RestoreAll + delegate Invoke + ReapplyAll)
+            // which keeps all frames managed and GC-walkable.
+            if (false && _callOrigTrampoline != IntPtr.Zero && CanUseTrampoline(methodInfo))
+            {
+                return InvokeViaTrampoline(methodInfo, instance, args);
+            }
+
+            // Path 0: for generic methods, use RestoreAll + invoke + ReapplyAll.
+            // Prefer the delegate's Invoke method (via delegate*) over MethodInfo.Invoke,
+            // because RuntimeMethodHandle.InvokeMethod (used by MethodInfo.Invoke) does not
+            // set up the generic dictionary for E9/DirectJump precodes on .NET Framework 4.x,
+            // causing AccessViolationException. The delegate's Invoke method is JIT-compiled
+            // with full knowledge of the generic arguments and correctly sets up the generic
+            // dictionary (R10 on CoreCLR, RDX on .NET Framework 4.x) before calling the precode.
+            // delegate* (managed function pointer) keeps the thread in cooperative GC mode,
+            // so object references are properly GC-tracked.
+            //
+            // MUST run on the SAME thread as the hook (not a clean thread).
+            // delegate* (calli) with managed calling convention requires the caller's
+            // stack to have proper GC-tracked frames for the object references passed
+            // as arguments. Running on a new thread (InvokeOnCleanThread) breaks this —
+            // the GC cannot find the object references during a GC triggered inside
+            // ConvertAll (e.g. when allocating the result List), causing
+            // AccessViolationException. After RestoreAll, ALL patches are removed,
+            // so there is no re-entrancy risk (the hook cannot re-trigger).
             if (_needsGenericAdapter)
             {
                 RestoreAll();
                 try
                 {
+                    // MethodInfo.Invoke crashes with 0x80131506 for hooked generic
+                    // methods on ALL frameworks:
+                    // - .NET Framework 4.x: RuntimeMethodHandle.InvokeMethod does not
+                    //   set up the generic dictionary for E9/DirectJump precodes.
+                    // - .NET 6+: The CLR's internal type-checking code path
+                    //   (RuntimeTypeHandle.IsInstanceOfType) crashes after the JIT
+                    //   code has been patched and restored, even though the original
+                    //   bytes are restored correctly.
+                    //
+                    // The delegate's Invoke method is JIT-compiled with full knowledge
+                    // of the generic arguments and correctly sets up the generic
+                    // dictionary (R10 on CoreCLR, RDX on .NET Framework 4.x) before
+                    // calling the precode. delegate* (managed function pointer) keeps
+                    // the thread in cooperative GC mode, so object references are
+                    // properly GC-tracked. At the ABI level, all reference type
+                    // parameters use the same calling convention (object pointer in
+                    // RCX/RDX/R8/R9), so delegate*<object,...> is compatible with the
+                    // delegate's Invoke method regardless of its concrete parameter
+                    // types.
+                    if (_delegateInvokeFptr != IntPtr.Zero && _originalDelegate != null
+                        && CanUseTrampoline(methodInfo))
+                    {
+                        return InvokeViaDelegateFptr(methodInfo, instance, args);
+                    }
+                    // Fallback: MethodInfo.Invoke (may crash with 0x80131506)
                     if (methodInfo.IsStatic)
-                        return InvokeOnCleanThread(() => methodInfo.Invoke(null, args));
-                    return InvokeOnCleanThread(() => methodInfo.Invoke(instance, args));
+                        return methodInfo.Invoke(null, args);
+                    return methodInfo.Invoke(instance, args);
                 }
                 finally
                 {
                     ReapplyAll();
                 }
-            }
-
-            // Path 0b: call-original trampoline (copy-prologue) for non-generic methods.
-            // The trampoline has its own copy of the original prologue and JMPs
-            // past the 5-byte patch, so NO RestoreAll/ReapplyAll is needed.
-            if (_callOrigTrampoline != IntPtr.Zero && CanUseTrampoline(methodInfo))
-            {
-                return InvokeViaTrampoline(methodInfo, instance, args);
             }
 
             // Path 1: cached delegate's Invoke via function pointer.
@@ -1695,6 +2509,7 @@ namespace DynamicHook
             // Using delegate* to call the delegate's Invoke method bypasses
             // reflection entirely. The Invoke method is non-generic and sets
             // up the generic dictionary (R10) before calling the target.
+            // MUST run on the SAME thread — see Path 0 comment for details.
             if (_originalDelegate != null)
             {
                 RestoreAll();
@@ -1732,15 +2547,16 @@ namespace DynamicHook
                 }
             }
 
-            // Path 2: RestoreAll + MethodInfo.Invoke on a clean thread + ReapplyAll.
+            // Path 2: RestoreAll + MethodInfo.Invoke + ReapplyAll.
+            // Must run on the same thread — see Path 0 comment for details.
             RestoreAll();
             try
             {
                 if (methodInfo.IsStatic)
                 {
-                    return InvokeOnCleanThread(() => methodInfo.Invoke(null, args));
+                    return methodInfo.Invoke(null, args);
                 }
-                return InvokeOnCleanThread(() => methodInfo.Invoke(instance, args));
+                return methodInfo.Invoke(instance, args);
             }
             finally
             {
@@ -2037,6 +2853,11 @@ namespace DynamicHook
                 SafeTry("FreeExec callOrigTrampoline", () => Memory.FreeExec(_callOrigTrampoline, _callOrigTrampSize));
                 _callOrigTrampoline = IntPtr.Zero;
             }
+            if (_hookAdapterTrampoline != IntPtr.Zero)
+            {
+                SafeTry("FreeExec hookAdapterTrampoline", () => Memory.FreeExec(_hookAdapterTrampoline, 12));
+                _hookAdapterTrampoline = IntPtr.Zero;
+            }
             _isInstalled = false;
         }
 
@@ -2079,15 +2900,10 @@ namespace DynamicHook
                     SafeTry("Restore indirectTargetLoc", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _originalIndirectTarget));
                     break;
                 case 2:
-                    if (_patchAddress != IntPtr.Zero && _originalBytes != null)
-                    {
-                        SafeTry("Restore patchAddress case2", () => Jumper.Restore(_patchAddress, _originalBytes));
-                    }
-                    break;
                 case 3:
                     if (_patchAddress != IntPtr.Zero && _originalBytes != null)
                     {
-                        SafeTry("Restore patchAddress case3", () => Jumper.Restore(_patchAddress, _originalBytes));
+                        SafeTry("Restore patchAddress", () => Jumper.Restore(_patchAddress, _originalBytes));
                     }
                     break;
             }
@@ -2106,6 +2922,10 @@ namespace DynamicHook
             if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
             {
                 SafeTry("Restore target2", () => MemOps.WriteIntPtrCell(_target2Loc, _target2OriginalValue));
+            }
+            if (_hasFixupJitAddrPatch && _fixupJitAddrLoc != IntPtr.Zero)
+            {
+                SafeTry("Restore fixupJitAddr", () => MemOps.WriteIntPtrCell(_fixupJitAddrLoc, _fixupJitAddrOriginal));
             }
         }
 
@@ -2179,6 +2999,10 @@ namespace DynamicHook
             if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
             {
                 SafeTry("Reapply target2", () => MemOps.WriteIntPtrCell(_target2Loc, _newSlotValue));
+            }
+            if (_hasFixupJitAddrPatch && _fixupJitAddrLoc != IntPtr.Zero)
+            {
+                SafeTry("Reapply fixupJitAddr", () => MemOps.WriteIntPtrCell(_fixupJitAddrLoc, _newSlotValue));
             }
         }
 

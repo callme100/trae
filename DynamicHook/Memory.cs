@@ -317,6 +317,57 @@ namespace DynamicHook
         [DllImport("kernel32.dll")]
         private static extern IntPtr VirtualQuery(IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, UIntPtr dwLength);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CFG_CALL_TARGET_INFO
+        {
+            public IntPtr Offset;
+            public IntPtr Flags;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetProcessValidCallTargets(
+            IntPtr hProcess,
+            IntPtr baseAddress,
+            UIntPtr regionSize,
+            uint numberOfOffsets,
+            ref CFG_CALL_TARGET_INFO offsetInformation);
+
+        private static readonly IntPtr CurrentProcessHandle = new IntPtr(-1);
+
+        private const int CFG_CALL_TARGET_VALID = 1;
+
+        /// <summary>
+        /// Registers an executable address as a valid indirect call target for
+        /// Control Flow Guard (CFG). On .NET 6+, the runtime (coreclr.dll) is built
+        /// with CFG enabled, so every indirect call (including managed <c>calli</c>
+        /// emitted for <c>delegate*</c>) is validated against the CFG bitmap. Memory
+        /// allocated via <c>VirtualAlloc</c> is NOT in the bitmap by default, so an
+        /// indirect call to a trampoline living in such memory raises
+        /// <c>STATUS_ACCESS_VIOLATION</c> (0xC0000005). This call marks the address
+        /// as a valid target so CFG permits the indirect call.
+        /// On systems where CFG is not enabled, this is a harmless no-op.
+        /// </summary>
+        public static void RegisterValidCallTarget(IntPtr addr, int size)
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+            if (IntPtr.Size != 8) return; // CFG bitmap is only meaningful on x64
+
+            CFG_CALL_TARGET_INFO info = new CFG_CALL_TARGET_INFO
+            {
+                Offset = IntPtr.Zero,
+                Flags = new IntPtr(CFG_CALL_TARGET_VALID)
+            };
+            try
+            {
+                SetProcessValidCallTargets(CurrentProcessHandle, addr, (UIntPtr)(ulong)size, 1, ref info);
+            }
+            catch
+            {
+                // Older Windows versions (pre-Win8.1) don't have this API; ignore.
+            }
+        }
+
         [DllImport("libc", SetLastError = true)]
         private static extern int mprotect(IntPtr addr, UIntPtr len, int prot);
 

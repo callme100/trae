@@ -1,0 +1,8 @@
+﻿dotnet : Fatal error. System.AccessViolationException: Attempted to read or write protected memory. This is often an in
+dication that other memory is corrupt.
+At line:15 char:3670
++ ... pgrep\bin'; dotnet run --project c:\trae\DynamicHook.Tests\ReproConso ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Fatal error. Sy...ory is corrupt.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

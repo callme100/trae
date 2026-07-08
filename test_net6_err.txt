@@ -1,0 +1,8 @@
+Fatal error. System.AccessViolationException: Attempted to read or write protected memory. This is often an indication that other memory is corrupt.
+   at System.Collections.Generic.List`1[[System.Int32, System.Private.CoreLib, Version=6.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]].ConvertAll[[System.__Canon, System.Private.CoreLib, Version=6.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]](System.Converter`2<Int32,System.__Canon>)
+   at DynamicHook.MethodHook.InvokeViaFptr(IntPtr, System.Object[], Boolean)
+   at DynamicHook.MethodHook.InvokeViaTrampoline(System.Reflection.MethodInfo, System.Object, System.Object[])
+   at DynamicHook.MethodHook.CallOriginal(System.Object, System.Object[])
+   at DynamicHook.ReproConsole.Program.HookWithCallOriginal(System.Collections.Generic.List`1<Int32>, System.Converter`2<Int32,System.String>)
+   at DynamicHook.ReproConsole.Program.TestWithCallOriginal()
+   at DynamicHook.ReproConsole.Program.Main(System.String[])

@@ -53,6 +53,8 @@ namespace DynamicHook
 
         public string CallOrigStatus;
 
+        public byte[] CallOrigTrampolineBytes;
+
         public override string ToString()
         {
             StringBuilder stringBuilder = new StringBuilder();
@@ -110,6 +112,10 @@ namespace DynamicHook
             if (!string.IsNullOrEmpty(CallOrigStatus))
             {
                 stringBuilder.AppendLine("CallOrig:      " + CallOrigStatus);
+            }
+            if (CallOrigTrampolineBytes != null && CallOrigTrampolineBytes.Length > 0)
+            {
+                stringBuilder.AppendLine("CallOrigTramp: " + FormatBytes(CallOrigTrampolineBytes));
             }
             return stringBuilder.ToString();
         }
