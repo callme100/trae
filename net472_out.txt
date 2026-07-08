@@ -1,6 +1,0 @@
-Runtime: 4.0.30319.42000
-64-bit: True
-
-=== Test 1: Cold-start hook (NO pre-warm) ===
-  Patch: DirectJump(E9) | ; resolved fixup code -> real JIT at 0x7FFC92384860; SecondaryJitPatch(5-byte) at 0x7FFC92384860 -> tramp 0x7FFC92370000
-  Precode bytes: E9-AB-DD-EE-FF-5F-00-00-B8-48-38-92-FC-7F-00-00-E9-6B-DC-EE-FF-5F-00-00-38-AF-68-F0-FC-7F-00-00
