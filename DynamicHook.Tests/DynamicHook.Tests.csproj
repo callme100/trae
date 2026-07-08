@@ -36,4 +36,32 @@
     <ProjectReference Include="..\DynamicHook\DynamicHook.csproj" />
   </ItemGroup>
 
+  <!--
+    ReproConsole 是独立的嵌套项目（有自己的 .csproj），必须从测试程序集中排除，
+    否则它的 Program.Main 会被当作第二个入口点导致测试项目编译失败。
+  -->
+  <ItemGroup>
+    <Compile Remove="ReproConsole\**" />
+    <None Remove="ReproConsole\**" />
+    <EmbeddedResource Remove="ReproConsole\**" />
+  </ItemGroup>
+
+  <!--
+    构建并复制 ReproConsole 子进程产物到测试输出目录。
+    ReproConsole 是 String.Compare hook 测试使用的独立子进程（脱离 testhost，
+    避免运行时内部高频 String.Compare 调用造成的递归）。
+    ReproConsole 固定目标 net8.0；将其整个输出目录复制到测试输出的 ReproConsole\
+    子目录下，测试通过 dotnet <dll> 方式启动它。
+  -->
+  <Target Name="BuildAndCopyReproConsole" AfterTargets="Build">
+    <MSBuild Projects="ReproConsole\ReproConsole.csproj"
+             Properties="Configuration=$(Configuration)" />
+    <ItemGroup>
+      <ReproConsoleFiles Include="ReproConsole\bin\$(Configuration)\net8.0\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ReproConsoleFiles)"
+          DestinationFolder="$(OutDir)ReproConsole\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

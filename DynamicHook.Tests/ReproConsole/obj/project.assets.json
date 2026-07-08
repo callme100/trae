@@ -1,0 +1,89 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0": {
+      "DynamicHook/1.0.0": {
+        "type": "project",
+        "framework": ".NETStandard,Version=v2.0",
+        "compile": {
+          "bin/placeholder/DynamicHook.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/DynamicHook.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "DynamicHook/1.0.0": {
+      "type": "project",
+      "path": "../../DynamicHook/DynamicHook.csproj",
+      "msbuildProject": "../../DynamicHook/DynamicHook.csproj"
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "DynamicHook >= 1.0.0"
+    ]
+  },
+  "packageFolders": {
+    "/root/.nuget/packages/": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "/workspace/DynamicHook.Tests/ReproConsole/ReproConsole.csproj",
+      "projectName": "ReproConsole",
+      "projectPath": "/workspace/DynamicHook.Tests/ReproConsole/ReproConsole.csproj",
+      "packagesPath": "/root/.nuget/packages/",
+      "outputPath": "/workspace/DynamicHook.Tests/ReproConsole/obj/",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "/root/.nuget/NuGet/NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "projectReferences": {
+            "/workspace/DynamicHook/DynamicHook.csproj": {
+              "projectPath": "/workspace/DynamicHook/DynamicHook.csproj"
+            }
+          }
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      }
+    },
+    "frameworks": {
+      "net8.0": {
+        "targetAlias": "net8.0",
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "/usr/lib/dotnet/sdk/8.0.128/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

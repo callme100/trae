@@ -193,6 +193,16 @@ namespace DynamicHook
             byte* ptr2 = (byte*)(void*)ptr;
             byte b = *ptr2;
             byte b2 = ptr2[1];
+            // Guard: if this looks like a real JIT code prologue (push reg,
+            // sub rsp, etc.), do NOT scan for 48 B8 patterns in the body —
+            // those bytes are instruction operands/data, not jump targets.
+            // Returning ptr here stops ResolveRealEntry's chain at the JIT
+            // entry, preventing the 48 B8 scan from overshooting into
+            // unrelated code and mis-resolving to an indirect-jump stub.
+            if (LooksLikeJitPrologue(ptr2))
+            {
+                return ptr;
+            }
             if (b == byte.MaxValue && b2 == 37)
             {
                 int num = *(int*)(ptr2 + 2);
@@ -262,6 +272,46 @@ namespace DynamicHook
                 }
             }
             return ptr;
+        }
+
+        /// <summary>
+        /// Heuristic: returns true if the bytes at <paramref name="p"/> look like
+        /// a real JIT-compiled function prologue, rather than a precode, fixup
+        /// thunk, or data structure. Used by ResolveOneX64 to STOP resolution at
+        /// the JIT entry instead of scanning the prologue body for 48 B8 patterns
+        /// (which would mis-match instruction operands and overshoot).
+        ///
+        /// Recognized prologues (x64):
+        ///   50-57             push rxx
+        ///   48 89 5C 24 xx     mov [rsp+xx], rbx
+        ///   48 83 EC xx        sub rsp, xx
+        ///   48 81 EC xx xx xx xx sub rsp, imm32
+        ///   55 48 8B EC         push rbp; mov rbp, rsp
+        ///   48 8D 6C 24 xx      lea rbp, [rsp+xx]
+        /// </summary>
+        private unsafe static bool LooksLikeJitPrologue(byte* p)
+        {
+            byte b0 = p[0];
+            // push rax/rcx/rdx/rbx/rsp/rbp/rsi/rdi (50-57)
+            if (b0 >= 0x50 && b0 <= 0x57) return true;
+            // REX.W prefix (48) followed by common prologue opcodes
+            if (b0 == 0x48)
+            {
+                byte b1 = p[1];
+                // 48 89 .. .. : mov [rsp+..], reg  (89 /r with SIB)
+                if (b1 == 0x89) return true;
+                // 48 83 EC xx : sub rsp, imm8
+                if (b1 == 0x83 && p[2] == 0xEC) return true;
+                // 48 81 EC .. : sub rsp, imm32
+                if (b1 == 0x81 && p[2] == 0xEC) return true;
+                // 48 8B EC   : mov rbp, rsp  (often after 55 push rbp)
+                if (b1 == 0x8B && p[2] == 0xEC) return true;
+                // 48 8D 6C 24 xx : lea rbp, [rsp+xx]
+                if (b1 == 0x8D && p[2] == 0x6C && p[3] == 0x24) return true;
+                // 48 8D 64 24 xx : lea rsp, [rsp+xx]
+                if (b1 == 0x8D && p[2] == 0x64 && p[3] == 0x24) return true;
+            }
+            return false;
         }
 
         private unsafe static IntPtr ResolveOneX86(IntPtr ptr)

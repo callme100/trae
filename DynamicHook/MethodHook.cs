@@ -491,12 +491,18 @@ namespace DynamicHook
             }
             _newSlotValue = intPtr;
             hookDiagInfo.JumpTargetAddr = intPtr;
-            InstallSlotReplacement(functionPointer, intPtr, hookDiagInfo);
-            // Set _isInstalled before InstallCodePatch so that if the hook is triggered
+            // Set _isInstalled before any patch so that if the hook is triggered
             // during patch installation (e.g., by String.Format or other BCL methods),
             // CallOriginal can correctly restore/invoke/reapply instead of throwing.
             _isInstalled = true;
+            // InstallCodePatch MUST run BEFORE InstallSlotReplacement:
+            // InstallSecondaryJitPatch (inside InstallCodePatch) resolves the target's
+            // real JIT code by following the precode's FF 25 indirect-target slot.
+            // If InstallSlotReplacement runs first, it overwrites that slot with the
+            // hook address, and InstallSecondaryJitPatch would patch the hook's own
+            // JIT code — creating an infinite E9→trampoline→hook→E9 loop.
             InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
+            InstallSlotReplacement(functionPointer, intPtr, hookDiagInfo);
             DiagInfo = hookDiagInfo;
         }
 
@@ -1314,6 +1320,12 @@ namespace DynamicHook
         {
             try
             {
+                // NOTE: InstallCodePatch (which calls this) now runs BEFORE
+                // InstallSlotReplacement, so the precode's indirect-target slot
+                // still holds the real JIT code address. ResolveRealEntry follows
+                // FF 25 → slot → JIT code correctly. (If slot were already patched
+                // to the hook address, this would resolve to the hook and create
+                // an infinite E9→trampoline→hook→E9 loop.)
                 IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(targetPtr);
                 // .NET Framework 4.x E8 precode: ResolveRealEntry treats E8+5E as a
                 // precode sentinel and returns without following. Manually follow
