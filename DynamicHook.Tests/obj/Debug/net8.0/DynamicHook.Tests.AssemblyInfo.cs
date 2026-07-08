@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("DynamicHook.Tests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a8243ab9df43b0af9b965d3fa368ba76faadb7fe")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8b35a68ad1364a4eacb907ed94c642f3e334f072")]
 [assembly: System.Reflection.AssemblyProductAttribute("DynamicHook.Tests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("DynamicHook.Tests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

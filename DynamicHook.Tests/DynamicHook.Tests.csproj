@@ -14,6 +14,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- ReproConsole is a separate nested project (own .csproj); exclude its
+         sources from the test assembly so it does not drag in a 2nd entry point. -->
+    <Compile Remove="ReproConsole\**" />
+    <None Remove="ReproConsole\**" />
+    <EmbeddedResource Remove="ReproConsole\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\DynamicHook\DynamicHook.csproj" />
   </ItemGroup>
 
