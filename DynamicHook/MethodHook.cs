@@ -23,6 +23,18 @@ namespace DynamicHook
 
         private IntPtr _newSlotValue;
 
+        /// <summary>
+        /// Per-slot original value captured BEFORE each slot is overwritten in
+        /// InstallSlotReplacement. Generic-dictionary slots may originally hold
+        /// different code pointers (precode addr, fixup-thunk addr, or JIT code
+        /// addr), so RestoreAll must restore each slot to ITS OWN original value
+        /// rather than a uniform _originalSlotValue (which is just the precode
+        /// address). Restoring a dict slot that held the JIT code address back to
+        /// the precode address corrupts the generic dictionary and leaves the
+        /// method uncallable after uninstall.
+        /// </summary>
+        private Dictionary<IntPtr, IntPtr> _slotOriginalValues;
+
         private int _patchType;
 
         private IntPtr _patchAddress;
@@ -806,8 +818,16 @@ namespace DynamicHook
                 diag.SlotCount = _slotAddresses.Count;
                 diag.SlotAddresses = (from a in _slotAddresses.Take(10)
                                       select a.ToInt64()).ToList();
+                // Capture each slot's original value BEFORE overwriting. Generic-
+                // dictionary slots may hold different code pointers (precode addr,
+                // fixup-thunk addr, or JIT code addr), so each must be restored to
+                // its own original value at uninstall — not a uniform precode addr.
+                _slotOriginalValues = new Dictionary<IntPtr, IntPtr>();
                 foreach (IntPtr slotAddress in _slotAddresses)
                 {
+                    IntPtr orig = IntPtr.Zero;
+                    try { orig = MemOps.ReadIntPtr(slotAddress); } catch { }
+                    _slotOriginalValues[slotAddress] = orig;
                     SlotPatcher.ReplaceSlot(slotAddress, jumpTarget);
                 }
             }
@@ -825,10 +845,13 @@ namespace DynamicHook
         /// FF 25 precode (.NET 6+ FixupPrecode): FF 25 <disp32> -> [mem] = fixup thunk addr
         /// E9 precode (.NET Framework 4.x DirectJump): E9 <rel32> -> fixup thunk addr
         ///
-        /// Fixup thunk format (instance methods):
-        ///   49 89 D0 | 48 BA <8-byte dict> | 48 B8 <8-byte jit_addr> | FF E0
-        ///   MOV R10, RDX; MOV RDX, dict; MOV RAX, jit_addr; JMP RAX
-        /// The generic dictionary address is at offset 5 (operand of 48 BA).
+        /// Fixup thunk format (first 5 bytes differ by platform ABI; the dict operand
+        /// is at offset 5 in both, the JIT address at offset 15):
+        ///   Windows x64: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
+        ///                (MOV R10,RDX; MOV RDX,dict) — dict in RDX
+        ///   Linux x64:   48 89 F2 48 BE <dict> 48 B8 <jit_addr> FF E0
+        ///                (MOV RDX,RSI; MOV RSI,dict) — dict in RSI
+        /// The generic dictionary address is the 8-byte operand at offset 5.
         /// </summary>
         private unsafe IntPtr ExtractGenericDictionaryFromFixup(IntPtr precodeAddr)
         {
@@ -861,9 +884,8 @@ namespace DynamicHook
                 if (fixupAddr == 0) return IntPtr.Zero;
                 if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return IntPtr.Zero;
                 byte* f = (byte*)fixupAddr;
-                // Check fixup thunk pattern: 49 89 D0 48 BA <8-byte dict> 48 B8 <8-byte code> FF E0
-                if (f[0] != 0x49 || f[1] != 0x89 || f[2] != 0xD0) return IntPtr.Zero;
-                if (f[3] != 0x48 || f[4] != 0xBA) return IntPtr.Zero;
+                // Accept both Windows (49 89 D0 48 BA) and Linux (48 89 F2 48 BE) prefixes.
+                if (!IsX64FixupThunkPrefix(f[0], f[1], f[2], f[3], f[4])) return IntPtr.Zero;
                 long dictAddr = *(long*)(f + 5);
                 if (dictAddr == 0) return IntPtr.Zero;
                 return new IntPtr(dictAddr);
@@ -1153,6 +1175,8 @@ namespace DynamicHook
         /// ResolveRealEntry for this — it follows the entire jump chain
         /// (including the fixup thunk's MOV RAX, &lt;jit_addr&gt;; JMP RAX),
         /// returning the &lt;jit_addr&gt; value instead of the fixup thunk address.
+        /// The fixup thunk prefix differs by platform ABI; see
+        /// <see cref="IsX64FixupThunkPrefix"/> (the 48 B8 + operand layout is shared).
         /// </summary>
         private unsafe IntPtr ResolveFixupThunkFromPrecode(IntPtr precodeAddr)
         {
@@ -1164,10 +1188,9 @@ namespace DynamicHook
                 int rel32 = *(int*)(p + 1);
                 long fixupAddr = precodeAddr.ToInt64() + 5 + rel32;
                 if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return IntPtr.Zero;
-                // Verify fixup thunk pattern: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
+                // Verify fixup thunk prefix (Windows or Linux) + 48 B8 <jit_addr>.
                 byte* f = (byte*)fixupAddr;
-                if (f[0] != 0x49 || f[1] != 0x89 || f[2] != 0xD0) return IntPtr.Zero;
-                if (f[3] != 0x48 || f[4] != 0xBA) return IntPtr.Zero;
+                if (!IsX64FixupThunkPrefix(f[0], f[1], f[2], f[3], f[4])) return IntPtr.Zero;
                 if (f[13] != 0x48 || f[14] != 0xB8) return IntPtr.Zero;
                 return new IntPtr(fixupAddr);
             }
@@ -1185,9 +1208,8 @@ namespace DynamicHook
                 long fixupAddr = precodeAddr.ToInt64() + 5 + rel32;
                 if (!Memory.IsReadable(new IntPtr(fixupAddr), 23)) return false;
                 byte* f = (byte*)fixupAddr;
-                // Check fixup thunk pattern: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> FF E0
-                if (f[0] != 0x49 || f[1] != 0x89 || f[2] != 0xD0) return false;
-                if (f[3] != 0x48 || f[4] != 0xBA) return false;
+                // Check fixup thunk prefix (Windows or Linux) + 48 B8 <jit_addr>.
+                if (!IsX64FixupThunkPrefix(f[0], f[1], f[2], f[3], f[4])) return false;
                 if (f[13] != 0x48 || f[14] != 0xB8) return false;
                 // The <jit_addr> is at offset 15 (operand of MOV RAX, imm64)
                 _fixupJitAddrLoc = new IntPtr(fixupAddr + 15);
@@ -1308,10 +1330,12 @@ namespace DynamicHook
         }
 
         /// <summary>
-        /// Detects the .NET Framework generic method fixup code pattern and extracts
-        /// the real JIT code address from it.
-        /// Pattern: 49 89 D0 | 48 BA <8-byte dict> | 48 B8 <8-byte jit_addr> | FF E0
-        /// The JIT code address is at offset 15 (after 48 B8 at offset 13).
+        /// Detects the x64 generic method fixup code pattern and extracts the real
+        /// JIT code address from it. The first 5 bytes (save + dict-register load)
+        /// differ by platform ABI; see <see cref="IsX64FixupThunkPrefix"/>. The rest
+        /// of the layout is identical on both ABIs:
+        ///   &lt;prefix 5B&gt; | &lt;8-byte dict&gt; | 48 B8 &lt;8-byte jit_addr&gt; | FF E0
+        /// The JIT code address is the 8-byte operand of MOV RAX at offset 15.
         /// </summary>
         private unsafe IntPtr TryResolveFixupToJitCode(IntPtr addr)
         {
@@ -1321,9 +1345,8 @@ namespace DynamicHook
             try
             {
                 byte* p = (byte*)addr;
-                // Check for 49 89 D0 48 BA at the start
-                if (p[0] != 0x49 || p[1] != 0x89 || p[2] != 0xD0) return IntPtr.Zero;
-                if (p[3] != 0x48 || p[4] != 0xBA) return IntPtr.Zero;
+                // Accept both Windows (49 89 D0 48 BA) and Linux (48 89 F2 48 BE) prefixes.
+                if (!IsX64FixupThunkPrefix(p[0], p[1], p[2], p[3], p[4])) return IntPtr.Zero;
                 // Check for 48 B8 at offset 13
                 if (p[13] != 0x48 || p[14] != 0xB8) return IntPtr.Zero;
                 // Read the JIT code address at offset 15
@@ -1452,17 +1475,92 @@ namespace DynamicHook
         }
 
         /// <summary>
-        /// Builds x64 register-shift code that converts from the .NET Framework 4.x
-        /// generic calling convention to the standard managed calling convention.
+        /// True on non-Windows x64 (Linux/macOS/BSD), which all use the System V
+        /// AMD64 calling convention (RDI, RSI, RDX, RCX, R8, R9, [RSP+8]) — as
+        /// opposed to the Windows x64 convention (RCX, RDX, R8, R9, [RSP+0x28]).
+        /// CoreCLR passes the generic dictionary in RSI (instance) / RDI (static)
+        /// on System V, vs RDX / RCX on Windows.
+        /// </summary>
+        private static bool IsSystemVX64 =>
+            Platform.Current == Platform.Arch.X64
+            && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        /// <summary>
+        /// Recognizes the x64 generic-method fixup thunk prefix. The thunk loads
+        /// the generic dictionary into a register, then jumps to the JIT code:
+        ///   &lt;save&gt; &lt;MOV dictReg, imm64 dict&gt; &lt;48 B8 imm64 jit&gt; &lt;FF E0&gt;
+        /// Only the first 5 bytes (save + dictReg load) differ by ABI:
+        ///   Windows x64: 49 89 D0 48 BA  (MOV R10,RDX; MOV RDX,dict)  — dict in RDX
+        ///   Linux x64:   48 89 F2 48 BE  (MOV RDX,RSI; MOV RSI,dict)  — dict in RSI
+        /// The dict operand is at offset 5, the 48 B8 (MOV RAX,jit) at offset 13,
+        /// the jit operand at offset 15, and FF E0 (JMP RAX) at offset 21 — on both.
+        /// </summary>
+        private static bool IsX64FixupThunkPrefix(byte b0, byte b1, byte b2, byte b3, byte b4)
+        {
+            // Windows: 49 89 D0 48 BA
+            if (b0 == 0x49 && b1 == 0x89 && b2 == 0xD0 && b3 == 0x48 && b4 == 0xBA) return true;
+            // Linux / System V: 48 89 F2 48 BE
+            if (b0 == 0x48 && b1 == 0x89 && b2 == 0xF2 && b3 == 0x48 && b4 == 0xBE) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Builds x64 register-shift code that converts from the generic calling
+        /// convention to the standard managed calling convention.
         ///
-        /// Instance method: RCX=this (kept), RDX=genericDict (discarded),
-        ///   R8=arg1, R9=arg2, [stack]=arg3 → RCX=this, RDX=arg1, R8=arg2, R9=arg3
-        /// Static method: RCX=genericDict (discarded), RDX=arg1, R8=arg2,
-        ///   R9=arg3, [stack]=arg4 → RCX=arg1, RDX=arg2, R8=arg3, R9=arg4
+        /// Windows x64 (RCX, RDX, R8, R9, [RSP+0x28]):
+        ///   Instance: RCX=this (kept), RDX=genericDict (discarded),
+        ///     R8=arg1, R9=arg2, [stack]=arg3 → RCX=this, RDX=arg1, R8=arg2, R9=arg3
+        ///   Static: RCX=genericDict (discarded), RDX=arg1, R8=arg2,
+        ///     R9=arg3, [stack]=arg4 → RCX=arg1, RDX=arg2, R8=arg3, R9=arg4
+        ///
+        /// System V AMD64 / Linux (RDI, RSI, RDX, RCX, R8, R9, [RSP+8]):
+        ///   Instance: RDI=this (kept), RSI=genericDict (discarded),
+        ///     RDX=arg1, RCX=arg2, R8=arg3, R9=arg4, [stack]=arg5
+        ///     → RDI=this, RSI=arg1, RDX=arg2, RCX=arg3, R8=arg4, R9=arg5
+        ///   Static: RDI=genericDict (discarded), RSI=arg0, RDX=arg1,
+        ///     RCX=arg2, R8=arg3, R9=arg4 → RDI=arg0, RSI=arg1, RDX=arg2, ...
         /// </summary>
         private static byte[] BuildGenericAdapterBytes(bool isStatic, int userParamCount)
         {
             var bytes = new List<byte>();
+            if (IsSystemVX64)
+            {
+                // System V AMD64: args in RDI, RSI, RDX, RCX, R8, R9, [RSP+8].
+                // Generic dict occupies RSI (instance) / RDI (static); shift user
+                // args left by one register position, dropping the dict.
+                if (isStatic)
+                {
+                    // dict in RDI; shift user args left from RDI.
+                    if (userParamCount >= 1)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xF7 });       // MOV RDI, RSI
+                    if (userParamCount >= 2)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xD6 });       // MOV RSI, RDX
+                    if (userParamCount >= 3)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xCA });       // MOV RDX, RCX
+                    if (userParamCount >= 4)
+                        bytes.AddRange(new byte[] { 0x4C, 0x89, 0xC1 });       // MOV RCX, R8
+                    if (userParamCount >= 5)
+                        bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC8 });       // MOV R8, R9
+                }
+                else
+                {
+                    // dict in RSI (this stays in RDI); shift user args left from RSI.
+                    if (userParamCount >= 1)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xD6 });       // MOV RSI, RDX
+                    if (userParamCount >= 2)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xCA });       // MOV RDX, RCX
+                    if (userParamCount >= 3)
+                        bytes.AddRange(new byte[] { 0x4C, 0x89, 0xC1 });       // MOV RCX, R8
+                    if (userParamCount >= 4)
+                        bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC8 });       // MOV R8, R9
+                    if (userParamCount >= 5)
+                        bytes.AddRange(new byte[] { 0x4C, 0x8B, 0x4C, 0x24, 0x08 }); // MOV R9, [RSP+8]
+                }
+                return bytes.ToArray();
+            }
+            // Windows x64: args in RCX, RDX, R8, R9, [RSP+0x28].
+            // Generic dict occupies RDX (instance) / RCX (static).
             if (isStatic)
             {
                 // Generic dict is in RCX; shift user args left: RCX←RDX, RDX←R8, R8←R9
@@ -1493,20 +1591,66 @@ namespace DynamicHook
         /// calling convention to the GENERIC calling convention (reverse of
         /// BuildGenericAdapterBytes). This is needed by the call-original trampoline
         /// because delegate*/Marshal.GetDelegateForFunctionPointer passes args in
-        /// standard convention (RCX, RDX, R8, R9), but the original JIT code for
-        /// generic methods expects them in generic convention.
+        /// the standard managed convention, but the original JIT code for generic
+        /// methods expects them in the generic convention (dict inserted at the
+        /// ABI's second/first arg register, user args shifted right by one).
         ///
-        /// Instance method: RCX=this, RDX=arg1, R8=arg2, R9=arg3
-        ///   → RCX=this, RDX=genericDict, R8=arg1, R9=arg2, [stack]=arg3
-        /// Static method: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
-        ///   → RCX=genericDict, RDX=arg0, R8=arg1, R9=arg2, [stack]=arg3
+        /// Windows x64 (RCX, RDX, R8, R9, [RSP+0x28]):
+        ///   Instance: RCX=this, RDX=arg1, R8=arg2, R9=arg3
+        ///     → RCX=this, RDX=genericDict, R8=arg1, R9=arg2, [stack]=arg3
+        ///   Static: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
+        ///     → RCX=genericDict, RDX=arg0, R8=arg1, R9=arg2, [stack]=arg3
         ///
-        /// R10 must already be set to genericDict before this code runs.
-        /// The shift goes right-to-left (last arg first) to avoid overwriting.
+        /// System V AMD64 / Linux (RDI, RSI, RDX, RCX, R8, R9, [RSP+8]):
+        ///   Instance: RDI=this, RSI=arg1, RDX=arg2, RCX=arg3
+        ///     → RDI=this, RSI=genericDict, RDX=arg1, RCX=arg2, R8=arg3
+        ///   Static: RDI=arg0, RSI=arg1, RDX=arg2, RCX=arg3
+        ///     → RDI=genericDict, RSI=arg0, RDX=arg1, RCX=arg2, R8=arg3
+        ///
+        /// R10 must already be set to genericDict before this code runs (it is a
+        /// scratch register on both ABIs, not used for arg passing). The shift goes
+        /// right-to-left (last arg first) to avoid overwriting, then the dict is
+        /// loaded into the ABI's dict register from R10.
         /// </summary>
         private static byte[] BuildReverseGenericAdapterBytes(bool isStatic, int userParamCount)
         {
             var bytes = new List<byte>();
+            if (IsSystemVX64)
+            {
+                // System V AMD64: shift user args right by one (from RSI for instance,
+                // from RDI for static) to make room for the dict, then load the dict
+                // from R10 into RSI (instance) / RDI (static). Right-to-left order so
+                // no register is read after it has been overwritten.
+                //
+                // Standard:  RDI, RSI, RDX, RCX, R8, R9, [RSP+8]
+                // The shared shift-right (applies to both instance and static) spills
+                // the highest-register user arg first, then walks down.
+                if (userParamCount >= 5)
+                    bytes.AddRange(new byte[] { 0x4C, 0x89, 0x4C, 0x24, 0x08 }); // MOV [RSP+8], R9
+                if (userParamCount >= 4)
+                    bytes.AddRange(new byte[] { 0x4D, 0x89, 0xC1 });       // MOV R9, R8
+                if (userParamCount >= 3)
+                    bytes.AddRange(new byte[] { 0x49, 0x89, 0xC8 });       // MOV R8, RCX
+                if (userParamCount >= 2)
+                    bytes.AddRange(new byte[] { 0x48, 0x89, 0xD1 });       // MOV RCX, RDX
+                if (userParamCount >= 1)
+                    bytes.AddRange(new byte[] { 0x48, 0x89, 0xF2 });       // MOV RDX, RSI
+                if (isStatic)
+                {
+                    // arg0 (RDI) → RSI, then dict (R10) → RDI
+                    if (userParamCount >= 1)
+                        bytes.AddRange(new byte[] { 0x48, 0x89, 0xFE });   // MOV RSI, RDI
+                    bytes.AddRange(new byte[] { 0x4C, 0x89, 0xF7 });       // MOV RDI, R10
+                }
+                else
+                {
+                    // dict (R10) → RSI (this in RDI is unchanged)
+                    bytes.AddRange(new byte[] { 0x4C, 0x89, 0xD6 });       // MOV RSI, R10
+                }
+                return bytes.ToArray();
+            }
+            // Windows x64: shift user args right by one (from RDX for instance,
+            // from RCX for static), then load dict from R10 into RDX/RCX.
             // Shift right by 1, starting from the last arg to avoid overwriting.
             if (userParamCount >= 3)
                 bytes.AddRange(new byte[] { 0x4C, 0x89, 0x4C, 0x24, 0x28 }); // MOV [RSP+0x28], R9
@@ -1689,16 +1833,15 @@ namespace DynamicHook
             try
             {
                 // Read the fixup code to extract the inner code address.
-                // The fixup thunk pattern is: 49 89 D0 48 BA <dict> 48 B8 <jit_addr> ...
-                // On .NET 8, it ends with FF E0 (JMP RAX). On .NET Framework 4.x,
-                // it may have additional instructions after <jit_addr> (e.g. 48 8B ...).
-                // We only require the prefix pattern (49 89 D0 48 BA ... 48 B8) to
-                // extract <jit_addr> at offset 15.
+                // The fixup thunk pattern's first 5 bytes differ by platform ABI
+                // (Windows: 49 89 D0 48 BA, Linux: 48 89 F2 48 BE); see
+                // IsX64FixupThunkPrefix. The 48 B8 <jit_addr> at offset 13 and the
+                // jit operand at offset 15 are identical on both ABIs. We only
+                // require the prefix + 48 B8 to extract <jit_addr> at offset 15.
                 byte[] fixupBytes = MemOps.ReadBytesSafe(target1Addr, 25);
                 IntPtr innerCodeAddr = IntPtr.Zero;
                 bool patternMatch = fixupBytes != null && fixupBytes.Length >= 23 &&
-                    fixupBytes[0] == 0x49 && fixupBytes[1] == 0x89 && fixupBytes[2] == 0xD0 &&
-                    fixupBytes[3] == 0x48 && fixupBytes[4] == 0xBA &&
+                    IsX64FixupThunkPrefix(fixupBytes[0], fixupBytes[1], fixupBytes[2], fixupBytes[3], fixupBytes[4]) &&
                     fixupBytes[13] == 0x48 && fixupBytes[14] == 0xB8;
                 if (!patternMatch && fixupBytes != null)
                 {
@@ -2005,11 +2148,10 @@ namespace DynamicHook
                     long fixupAddr = _precodeAddr.ToInt64() + 5 + rel32;
                     if (!Memory.IsReadable(new IntPtr(fixupAddr), 13)) return IntPtr.Zero;
                     byte* fp = (byte*)fixupAddr;
-                    // Check for 49 89 D0 48 BA pattern
-                    if (fp[0] == 0x49 && fp[1] == 0x89 && fp[2] == 0xD0 &&
-                        fp[3] == 0x48 && fp[4] == 0xBA)
+                    // Accept both Windows (49 89 D0 48 BA) and Linux (48 89 F2 48 BE) prefixes.
+                    if (IsX64FixupThunkPrefix(fp[0], fp[1], fp[2], fp[3], fp[4]))
                     {
-                        // Dictionary is the 8-byte operand of MOV RDX at offset 5
+                        // Dictionary is the 8-byte operand at offset 5 (MOV RDX/RSI, imm64)
                         long dict = *(long*)(fp + 5);
                         if (dict != 0) return new IntPtr(dict);
                     }
@@ -2057,10 +2199,14 @@ namespace DynamicHook
 
         /// <summary>
         /// Tries to extract the generic dictionary by following the ORIGINAL E9 jump
-        /// (from saved _originalBytes) to the fixup code, then scanning for the
-        /// MOV R10, imm64 (49 BA) pattern. This handles .NET 6+ precodes where the
-        /// generic dictionary is set up in the fixup code rather than inline in the
-        /// precode.
+        /// (from saved _originalBytes) to the fixup code, then scanning for a
+        /// MOV r64, imm64 instruction that loads the dictionary. This handles .NET
+        /// 6+ precodes where the generic dictionary is set up in the fixup code
+        /// rather than inline in the precode. The dict-load instruction differs by
+        /// platform ABI:
+        ///   Windows x64: 49 BA (MOV R10, imm64) — dict staged in R10
+        ///   Linux x64:   48 BE (MOV RSI, imm64) — dict in RSI (System V)
+        ///   (also 48 BA / MOV RDX for .NET Framework 4.x instance)
         /// </summary>
         private unsafe IntPtr TryExtractGenericDictFromOriginalPrecode()
         {
@@ -2073,15 +2219,9 @@ namespace DynamicHook
                 long fixupAddr = _precodeAddr.ToInt64() + 5 + rel32;
                 if (!Memory.IsReadable(new IntPtr(fixupAddr), 64)) return IntPtr.Zero;
                 byte* fp = (byte*)fixupAddr;
-                // Scan up to 64 bytes for 49 BA (MOV R10, imm64) pattern
-                for (int i = 0; i < 54; i++)
-                {
-                    if (fp[i] == 0x49 && fp[i + 1] == 0xBA)
-                    {
-                        long dict = *(long*)(fp + i + 2);
-                        if (dict != 0) return new IntPtr(dict);
-                    }
-                }
+                // Scan up to 64 bytes for a dict-load MOV r64, imm64 pattern.
+                long dict = ScanForGenericDictLoad(fp, 0, 54);
+                if (dict != 0) return new IntPtr(dict);
                 // Also try following any E9 rel32 in the fixup code (nested jump)
                 for (int i = 0; i < 59; i++)
                 {
@@ -2092,14 +2232,8 @@ namespace DynamicHook
                         if (Memory.IsReadable(new IntPtr(innerAddr), 24))
                         {
                             byte* ip = (byte*)innerAddr;
-                            for (int j = 0; j < 14; j++)
-                            {
-                                if (ip[j] == 0x49 && ip[j + 1] == 0xBA)
-                                {
-                                    long dict = *(long*)(ip + j + 2);
-                                    if (dict != 0) return new IntPtr(dict);
-                                }
-                            }
+                            dict = ScanForGenericDictLoad(ip, 0, 14);
+                            if (dict != 0) return new IntPtr(dict);
                         }
                     }
                 }
@@ -2108,6 +2242,36 @@ namespace DynamicHook
             {
             }
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Scans a code region for a MOV r64, imm64 instruction that loads the
+        /// generic dictionary, returning the 8-byte operand (or 0 if not found).
+        /// Recognized opcodes (all share the B8+rd imm64 form with a REX prefix):
+        ///   49 BA  (MOV R10, imm64) — Windows / .NET 6+ precode staging register
+        ///   48 BE  (MOV RSI, imm64) — Linux System V (dict in RSI)
+        ///   48 BA  (MOV RDX, imm64) — .NET Framework 4.x instance (dict in RDX)
+        ///   48 B9  (MOV RCX, imm64) — .NET Framework 4.x static (dict in RCX)
+        /// </summary>
+        private static unsafe long ScanForGenericDictLoad(byte* p, int start, int count)
+        {
+            for (int i = start; i < count; i++)
+            {
+                byte rex = p[i];
+                byte op = p[i + 1];
+                // REX.W (0x48) or REX.WB (0x49) or REX.WR (0x4C)
+                bool isMovImm64 =
+                    (rex == 0x49 && op == 0xBA) ||  // MOV R10, imm64 (Windows/.NET 6+)
+                    (rex == 0x48 && op == 0xBE) ||  // MOV RSI, imm64 (Linux)
+                    (rex == 0x48 && op == 0xBA) ||  // MOV RDX, imm64 (Win Fx instance)
+                    (rex == 0x48 && op == 0xB9);    // MOV RCX, imm64 (Win Fx static)
+                if (isMovImm64)
+                {
+                    long dict = *(long*)(p + i + 2);
+                    if (dict != 0) return dict;
+                }
+            }
+            return 0;
         }
 
         /// <summary>
@@ -2882,7 +3046,12 @@ namespace DynamicHook
             {
                 foreach (IntPtr slotAddress in _slotAddresses)
                 {
-                    SafeTry("RestoreSlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, _originalSlotValue));
+                    // Restore each slot to ITS OWN original value. Generic-dictionary
+                    // slots may have held the JIT code address (not the precode
+                    // address), so a uniform _originalSlotValue would corrupt them.
+                    IntPtr orig = (_slotOriginalValues != null && _slotOriginalValues.TryGetValue(slotAddress, out IntPtr v))
+                        ? v : _originalSlotValue;
+                    SafeTry("RestoreSlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, orig));
                 }
             }
             RestoreCodePatch();
