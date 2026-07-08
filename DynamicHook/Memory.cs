@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 
 namespace DynamicHook
@@ -266,8 +269,125 @@ namespace DynamicHook
                 return p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY
                     || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
             }
-            // Non-Windows: assume readable (mmap'd pages are readable until munmap'd)
+            // Non-Windows (Linux/macOS): consult /proc/self/maps to verify the
+            // address range lies within a readable mapping. Unlike mincore (which
+            // only reports whether a page is mapped, not its protection), the maps
+            // file distinguishes PROT_NONE pages (perms "---p") from genuinely
+            // readable ones ("r--p"/"r-xp"). This prevents AccessViolationException
+            // (uncatchable in .NET 8, terminates the process) when MethodTable/
+            // MethodDesc scans or candidate-code dereferences reach a PROT_NONE
+            // guard page. The parsed region list is cached for 1s to amortize the
+            // cost of reading /proc/self/maps across the thousands of per-slot
+            // checks performed by SlotPatcher.FindSlots.
+            var regions = GetReadableRegions(force: false);
+            if (regions == null || regions.Count == 0)
+            {
+                // Could not parse maps: fall back to the optimistic assumption.
+                return true;
+            }
+            if (IsInReadableRegion(regions, addr.ToInt64(), size)) return true;
+            // Cache miss: return true (optimistic). The address may belong to a
+            // region mapped after the cache was last parsed (e.g. freshly JIT-
+            // compiled code in a new code heap). Returning false here would cause
+            // hook installation to fail for recently-compiled methods. PROT_NONE
+            // guard pages are typically present from process start (so they're in
+            // the cached maps and correctly return false above); newly-mapped
+            // regions are almost always readable code/data heaps, not guard pages.
             return true;
+        }
+
+        // ===== /proc/self/maps readable-region cache (Linux) =====
+        //
+        // /proc/self/maps lists every mapped region with its protection. We keep
+        // the readable ones (perms start with 'r') in a sorted list and binary-
+        // search it from IsReadable. The list is cached for 1s to amortize the
+        // cost of reading /proc/self/maps across the thousands of per-slot checks
+        // performed by SlotPatcher.FindSlots. On cache miss IsReadable returns
+        // true (optimistic) so freshly-JITted code in new heaps is not rejected.
+
+        private static List<(long Start, long End)> s_readableRegions;
+        private static long s_readableRegionsTicks;
+        private static readonly object s_readableLock = new object();
+
+        private static List<(long Start, long End)> GetReadableRegions(bool force)
+        {
+            lock (s_readableLock)
+            {
+                long now = Environment.TickCount;
+                if (!force && s_readableRegions != null && (now - s_readableRegionsTicks) < 1000)
+                {
+                    return s_readableRegions;
+                }
+                s_readableRegions = ParseReadableRegions();
+                s_readableRegionsTicks = now;
+                return s_readableRegions;
+            }
+        }
+
+        private static List<(long Start, long End)> ParseReadableRegions()
+        {
+            var list = new List<(long Start, long End)>();
+            try
+            {
+                // /proc/self/maps is Linux-specific; on macOS this file does not
+                // exist and ParseReadableRegions returns an empty list, causing
+                // IsReadable to fall back to the optimistic assumption.
+                using (var fs = new FileStream("/proc/self/maps", FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs))
+                {
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        // Format: start-end perms offset dev inode pathname
+                        // e.g.  7f68b9d60000-7f68b9e80000 r-xp 00000000 00:00 0 /path
+                        int space = line.IndexOf(' ');
+                        if (space <= 0) continue;
+                        // perms immediately follow the range + space; readable iff 'r'.
+                        if (space + 1 >= line.Length || line[space + 1] != 'r') continue;
+                        int dash = line.IndexOf('-');
+                        if (dash <= 0 || dash >= space) continue;
+                        if (!long.TryParse(line.Substring(0, dash), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long start)) continue;
+                        if (!long.TryParse(line.Substring(dash + 1, space - dash - 1), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long end)) continue;
+                        list.Add((start, end));
+                    }
+                }
+                list.Sort((a, b) => a.Start.CompareTo(b.Start));
+            }
+            catch
+            {
+                // File missing or unreadable: return empty so callers fall back.
+            }
+            return list;
+        }
+
+        private static bool IsInReadableRegion(List<(long Start, long End)> regions, long addr, int size)
+        {
+            long end = addr + size;
+            int lo = 0, hi = regions.Count - 1;
+            while (lo <= hi)
+            {
+                int mid = lo + (hi - lo) / 2;
+                var r = regions[mid];
+                if (end <= r.Start)
+            {
+                hi = mid - 1;
+            }
+            else if (addr >= r.End)
+            {
+                lo = mid + 1;
+            }
+            else if (addr >= r.Start && end <= r.End)
+            {
+                return true;
+            }
+            else
+            {
+                // Overlaps a region boundary: not fully contained in one readable
+                // mapping, treat as unreadable.
+                return false;
+            }
+            }
+            return false;
         }
 
         /// <summary>

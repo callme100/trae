@@ -14,8 +14,16 @@ namespace DynamicHook
         {
             List<IntPtr> list = new List<IntPtr>();
             int size = IntPtr.Size;
-            long num = value.ToInt64();
-            long num2 = MethodEntryResolver.ResolveRealEntry(value).ToInt64();
+            // Match a slot if it holds ANY address in the precode→JIT resolution
+            // chain (the precode address itself, the first-level target, an
+            // intermediate fixup thunk, or the fully-resolved JIT code entry).
+            // On .NET 8, after tiered JIT or precode backpatching, a vtable slot
+            // frequently holds the precode's first-level target — an intermediate
+            // address that ResolveRealEntry skips over — so matching only the
+            // endpoints (precode addr and fully-resolved JIT entry) would miss it.
+            var candidates = new HashSet<long>();
+            foreach (IntPtr c in MethodEntryResolver.ResolveChain(value))
+                candidates.Add(c.ToInt64());
             if (methodDesc != IntPtr.Zero)
             {
                 for (int i = 0; i < methodDescScanSize; i += size)
@@ -27,7 +35,7 @@ namespace DynamicHook
                     try
                     {
                         long num3 = MemOps.ReadIntPtr(methodDesc + i).ToInt64();
-                        if (num3 == num || num3 == num2)
+                        if (candidates.Contains(num3))
                         {
                             list.Add(methodDesc + i);
                         }
@@ -58,7 +66,7 @@ namespace DynamicHook
                     try
                     {
                         long num4 = MemOps.ReadIntPtr(methodTable + j).ToInt64();
-                        if (num4 == num || num4 == num2)
+                        if (candidates.Contains(num4))
                         {
                             list.Add(methodTable + j);
                         }

@@ -421,6 +421,7 @@ namespace DynamicHook
             {
                 throw new ObjectDisposedException("MethodHook");
             }
+            System.Console.Error.WriteLine($"[MethodHook] Install START: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
             HookDiagInfo hookDiagInfo = new HookDiagInfo();
             hookDiagInfo.TargetMethod = _targetMethod.ToString();
             hookDiagInfo.HookMethod = _hookMethod.ToString();
@@ -498,6 +499,7 @@ namespace DynamicHook
             _isInstalled = true;
             InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
             DiagInfo = hookDiagInfo;
+            System.Console.Error.WriteLine($"[MethodHook] Install END: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
         }
 
         private void PrepareMethod(MethodBase method)
@@ -812,6 +814,25 @@ namespace DynamicHook
                             if (!_slotAddresses.Contains(s)) _slotAddresses.Add(s);
                         }
                         diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictScan at 0x" + genDictAddr.ToInt64().ToString("X") + " found " + dictSlots.Count + " slots";
+                    }
+                }
+
+                // Fallback (virtual methods only): on .NET 8, precode backpatching
+                // can update the precode chain to a NEW JIT code address while
+                // leaving a vtable slot still pointing to the OLD JIT code. The OLD
+                // address is not in the precode resolution chain, so chain-based
+                // FindSlots misses it. Virtual dispatch uses the vtable slot, so the
+                // hook is bypassed. Identify the method's own vtable slot by the
+                // MethodDesc reference that CoreCLR JIT code embeds in its prologue
+                // (MOV RAX,[RIP+disp32] = 48 8B 05), which loads the method's
+                // MethodDesc. This catches the stale-JIT slot without relying on
+                // CoreCLR-internal slot-number layout. Gated to IsVirtual because
+                // only virtual methods dispatch through vtable slots.
+                if (_slotAddresses.Count == 0 && methodTable != IntPtr.Zero && methodDesc != IntPtr.Zero && _targetMethod.IsVirtual)
+                {
+                    foreach (IntPtr s in FindSlotsByEmbeddedMethodDesc(methodTable, methodDesc, targetPtr, 65536))
+                    {
+                        if (!_slotAddresses.Contains(s)) _slotAddresses.Add(s);
                     }
                 }
 
@@ -1139,6 +1160,18 @@ namespace DynamicHook
             {
                 _patchType = 3;
                 _patchAddress = targetPtr;
+                // Safety guard: if the JIT code already starts with E9 (relative
+                // jump), a previous hook's uninstall failed to restore the original
+                // bytes. Skip the patch to avoid capturing a residual hook as
+                // "original" (which would create an infinite loop on uninstall).
+                byte[] guardBytes = MemOps.ReadBytes(targetPtr, 1);
+                if (guardBytes[0] == 0xE9)
+                {
+                    diag.PatchError += "; JitCodePatch SKIPPED: residual E9 detected at JIT code — previous uninstall may have failed";
+                    _patchType = 0;
+                    _patchAddress = IntPtr.Zero;
+                    return;
+                }
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                 diag.PatchType = "JitCode(12-byte)";
                 diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
@@ -1505,6 +1538,78 @@ namespace DynamicHook
         }
 
         /// <summary>
+        /// Fallback slot finder for the .NET 8 precode-backpatching case where a
+        /// vtable slot still holds the OLD JIT code address, which is no longer in
+        /// the current precode→JIT resolution chain (so chain-based FindSlots misses
+        /// it). CoreCLR JIT-compiled code begins its prologue with
+        ///   48 8B 05 <disp32>   (MOV RAX, [RIP+disp32])
+        /// which loads the method's own MethodDesc into RAX. By scanning the
+        /// MethodTable for pointer-sized values that look like code addresses
+        /// (same high byte range as the known precode/JIT code address), reading
+        /// each candidate's prologue, computing the RIP-relative target, and
+        /// matching it against the target method's MethodDesc, we identify the
+        /// method's own vtable slot without relying on CoreCLR-internal slot
+        /// layout. This catches the stale-JIT slot left behind by backpatching.
+        /// </summary>
+        private static unsafe List<IntPtr> FindSlotsByEmbeddedMethodDesc(IntPtr methodTable, IntPtr methodDesc, IntPtr hintCodeAddr, int scanSize)
+        {
+            var result = new List<IntPtr>();
+            if (methodTable == IntPtr.Zero || methodDesc == IntPtr.Zero) return result;
+            int size = IntPtr.Size;
+            long mdLong = methodDesc.ToInt64();
+            long hintLong = hintCodeAddr != IntPtr.Zero ? hintCodeAddr.ToInt64() : 0L;
+            // Derive the expected high-byte range from the known code address so we
+            // skip pointer values that clearly aren't code addresses (avoids the
+            // per-candidate /proc/self/maps binary search for the common case of
+            // non-code integers stored in the MethodTable). On Linux code is
+            // typically in the 0x7F.. mmap range. Memory.IsReadable (backed by
+            // /proc/self/maps on Linux) provides the authoritative safety check
+            // before dereferencing the candidate prologue.
+            const long highMask = 0xFF000000000000L;
+            long highBits = (hintLong != 0) ? (hintLong & highMask) : 0x7F000000000000L;
+            int consecutiveUnreadable = 0;
+            for (int i = 0; i < scanSize; i += size)
+            {
+                IntPtr slotAddr = methodTable + i;
+                if (!Memory.IsReadable(slotAddr, size))
+                {
+                    consecutiveUnreadable += size;
+                    if (consecutiveUnreadable >= 4096) break;
+                    continue;
+                }
+                consecutiveUnreadable = 0;
+                long candidate;
+                try { candidate = MemOps.ReadIntPtr(slotAddr).ToInt64(); }
+                catch { break; }
+                if ((candidate & highMask) != highBits) continue;
+                // Skip values already covered by chain-based matching.
+                if (candidate == hintLong) continue;
+                // Read the prologue for the MethodDesc load: 48 8B 05 <disp32>.
+                // Allow a couple of leading bytes (e.g. a prefix) by scanning the
+                // first few instruction-start offsets. The loaded address equals
+                // (prologue_loc + 7 + disp32) for a match at offset 0.
+                if (!Memory.IsReadable(new IntPtr(candidate), 16)) continue;
+                try
+                {
+                    byte* p = (byte*)candidate;
+                    for (int off = 0; off <= 3; off++)
+                    {
+                        if (p[off] != 0x48 || p[off + 1] != 0x8B || p[off + 2] != 0x05) continue;
+                        int disp = *(int*)(p + off + 3);
+                        long loaded = candidate + off + 7 + disp;
+                        if (loaded == mdLong)
+                        {
+                            if (!result.Contains(slotAddr)) result.Add(slotAddr);
+                        }
+                        break;
+                    }
+                }
+                catch { }
+            }
+            return result;
+        }
+
+        /// <summary>
         /// Builds x64 register-shift code that converts from the generic calling
         /// convention to the standard managed calling convention.
         ///
@@ -1707,6 +1812,20 @@ namespace DynamicHook
                 _secondaryJitAddress = intPtr;
                 int patchSize = 5;
                 _secondaryJitOriginalBytes = MemOps.ReadBytes(intPtr, patchSize);
+                // Safety guard: if the JIT code already starts with E9 (relative
+                // jump) or 48 B8 (absolute jump), a previous hook's uninstall
+                // failed to restore the original bytes. Capturing these as
+                // "original" would create an infinite loop on uninstall (the
+                // restored E9 would jump to a freed trampoline). Skip the patch
+                // and rely on the indirect-target + slot patches for hooking.
+                if (_secondaryJitOriginalBytes[0] == 0xE9 ||
+                    (_secondaryJitOriginalBytes[0] == 0x48 && _secondaryJitOriginalBytes[1] == 0xB8))
+                {
+                    diag.PatchError += "; SecondaryJitPatch SKIPPED: residual hook patch detected (E9/48B8) at JIT code — previous uninstall may have failed";
+                    _secondaryJitOriginalBytes = null;
+                    Memory.FreeExec(trampoline, trampolineSize);
+                    return;
+                }
                 byte[] patch = Jumper.BuildRelJump(intPtr, trampoline);
                 // Build diagnostic string BEFORE patching to avoid triggering hook via String.Format
                 string diagMsg = "; SecondaryJitPatch(5-byte) at 0x" + intPtr.ToInt64().ToString("X") + " -> tramp 0x" + trampoline.ToInt64().ToString("X");
@@ -1899,6 +2018,17 @@ namespace DynamicHook
                 }
                 _target1Address = target1Addr;
                 _target1OriginalBytes = MemOps.ReadBytes(target1Addr, 12);
+                // Safety guard: if the fixup thunk already starts with 48 B8
+                // (MOV RAX, imm64 — our absolute jump pattern), a previous hook's
+                // uninstall failed to restore the original fixup bytes. Capturing
+                // these as "original" would create an infinite loop on uninstall.
+                if (_target1OriginalBytes[0] == 0x48 && _target1OriginalBytes[1] == 0xB8)
+                {
+                    diag.PatchError += "; Target1Patch SKIPPED: residual hook patch detected (48B8) at fixup thunk — previous uninstall may have failed";
+                    _target1OriginalBytes = null;
+                    _target1Address = IntPtr.Zero;
+                    return;
+                }
                 byte[] patch = Jumper.BuildAbsJumpX64(jumpTarget);
                 MemOps.WriteBytesProtected(target1Addr, patch);
                 _hasTarget1Patch = true;
@@ -3001,7 +3131,10 @@ namespace DynamicHook
             {
                 return;
             }
+            System.Console.Error.WriteLine($"[MethodHook] Uninstall START: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
+            System.Console.Error.WriteLine($"[MethodHook] Uninstall: calling RestoreAll");
             RestoreAll();
+            System.Console.Error.WriteLine($"[MethodHook] Uninstall: RestoreAll done");
             if (_nearTrampoline != IntPtr.Zero)
             {
                 SafeTry("FreeExec nearTrampoline", () => Memory.FreeExec(_nearTrampoline, 12));
@@ -3023,6 +3156,7 @@ namespace DynamicHook
                 _hookAdapterTrampoline = IntPtr.Zero;
             }
             _isInstalled = false;
+            System.Console.Error.WriteLine($"[MethodHook] Uninstall END: {_targetMethod.DeclaringType?.Name}.{_targetMethod.Name}");
         }
 
         private void SafeTry(string description, Action action)

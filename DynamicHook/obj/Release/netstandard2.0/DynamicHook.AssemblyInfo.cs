@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("DynamicHook")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a55cca996029c215a9e2c24a3084e2d4d8058d27")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+399371e244943ff371421a6545a016e2a8db0fda")]
 [assembly: System.Reflection.AssemblyProductAttribute("DynamicHook")]
 [assembly: System.Reflection.AssemblyTitleAttribute("DynamicHook")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

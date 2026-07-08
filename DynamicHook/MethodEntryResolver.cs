@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace DynamicHook
 {
@@ -40,6 +41,58 @@ namespace DynamicHook
                 intPtr = intPtr2;
             }
             return intPtr;
+        }
+
+        /// <summary>
+        /// Returns every address in the precode→JIT resolution chain, starting
+        /// with <paramref name="ptr"/> itself followed by each hop produced by
+        /// one resolution step (first-level target, fixup thunk, fully-resolved
+        /// JIT code entry). Used by SlotPatcher.FindSlots to match vtable /
+        /// MethodDesc slots that may hold ANY intermediate address in the chain,
+        /// not just the endpoints. On .NET 8, after tiered JIT or precode
+        /// backpatching, a slot frequently holds the precode's first-level
+        /// target (an intermediate fixup thunk) which ResolveRealEntry skips
+        /// over — matching only the endpoints would miss it.
+        /// </summary>
+        public static List<IntPtr> ResolveChain(IntPtr ptr)
+        {
+            var chain = new List<IntPtr>();
+            if (ptr == IntPtr.Zero)
+            {
+                return chain;
+            }
+            Platform.Arch current = Platform.Current;
+            IntPtr cur = ptr;
+            chain.Add(cur);
+            for (int i = 0; i < 10; i++)
+            {
+                IntPtr next;
+                try
+                {
+                    switch (current)
+                    {
+                        case Platform.Arch.X64:
+                            next = ResolveOneX64(cur);
+                            break;
+                        case Platform.Arch.X86:
+                            next = ResolveOneX86(cur);
+                            break;
+                        default:
+                            return chain;
+                    }
+                }
+                catch
+                {
+                    return chain;
+                }
+                if (next == cur || next == IntPtr.Zero)
+                {
+                    return chain;
+                }
+                chain.Add(next);
+                cur = next;
+            }
+            return chain;
         }
 
         public static bool IsJump(IntPtr ptr)

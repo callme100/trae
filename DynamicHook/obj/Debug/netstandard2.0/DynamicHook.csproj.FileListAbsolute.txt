@@ -1,0 +1,11 @@
+/workspace/DynamicHook/bin/Debug/netstandard2.0/DynamicHook.deps.json
+/workspace/DynamicHook/bin/Debug/netstandard2.0/DynamicHook.dll
+/workspace/DynamicHook/bin/Debug/netstandard2.0/DynamicHook.pdb
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.csproj.AssemblyReference.cache
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.GeneratedMSBuildEditorConfig.editorconfig
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.AssemblyInfoInputs.cache
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.AssemblyInfo.cs
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.csproj.CoreCompileInputs.cache
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.sourcelink.json
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.dll
+/workspace/DynamicHook/obj/Debug/netstandard2.0/DynamicHook.pdb
