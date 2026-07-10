@@ -1,0 +1,25 @@
+=== .NET 8 string.Compare CallOriginal Loop Test ===
+CLR: .NET 8.0.28
+OS: Microsoft Windows 10.0.19045
+Arch: X64
+
+target: Int32 Compare(System.String, System.String)
+target.DeclaringType: System.String
+target.ReturnType: System.Int32
+IsStatic: True
+
+patchType = Instr(E9) + Indirect(FF 25 data) + JIT(E9)
+patchTarget = Precode
+precodeAddr = 0x00007FFC9D091FB0
+hookResolvedEntry = 0x00007FFC9D0A3860
+jitCodeAddr = 0x00007FFCFBB07410
+patchError = ; SecondaryJitPatch(5-byte) at 0x7FFCFBB07410 -> tramp 0x7FFCFB8B0000
+
+=== Calling string.Compare('hello', 'world') ===
+LOOP DETECTED — HookEntryCount=11
+  Result=0 HookEntries=11 CallOriginal=10
+
+=== Calling string.Compare('abc', 'abc') ===
+LOOP DETECTED — HookEntryCount=11
+  Result=0 HookEntries=11 CallOriginal=10
+Done.

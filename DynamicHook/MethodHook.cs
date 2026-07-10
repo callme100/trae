@@ -48,6 +48,16 @@ namespace DynamicHook
 
         private IntPtr _secondaryJitAddress;
 
+        /// <summary>
+        /// Target method's JIT code address, resolved in Install() BEFORE slot
+        /// replacement. Saved here so InstallSecondaryJitPatch can reuse it
+        /// instead of calling ResolveRealEntry again (which would follow the
+        /// now-modified MethodTable slot and resolve to the hook's address,
+        /// creating an infinite loop — especially when tiered compilation is
+        /// disabled, e.g. when a debugger is attached).
+        /// </summary>
+        private IntPtr _targetJitCode;
+
         private byte[] _secondaryJitOriginalBytes;
 
         /// <summary>
@@ -100,6 +110,16 @@ namespace DynamicHook
 
         private IntPtr _fixupJitAddrOriginal;
 
+        /// <summary>
+        /// True when the FF 25 precode's indirect target data cell has been
+        /// patched independently of _patchType. On .NET 8+, the CLR may
+        /// overwrite this data cell during tiered compilation promotion,
+        /// so we ALSO patch the precode instruction itself (_patchType=2).
+        /// This flag ensures the data cell is still restored/reapplied
+        /// during CallOriginal even when _patchType != 1.
+        /// </summary>
+        private bool _hasIndirectPatch;
+
         private IntPtr _callOrigTrampoline;
 
         private int _callOrigTrampSize;
@@ -140,6 +160,16 @@ namespace DynamicHook
         public bool IsInstalled => _isInstalled;
 
         public HookDiagInfo DiagInfo { get; private set; }
+
+        /// <summary>
+        /// True when the hook patch was applied to raw JIT code (no precode) and
+        /// the target method's IL is small enough to be JIT-inlined. On the
+        /// legacy .NET Framework 4.x JIT64, direct calls to such methods may be
+        /// inlined into callers, bypassing the hook. When this is true, inspect
+        /// <see cref="DiagInfo"/>.<see cref="HookDiagInfo.InliningRiskMessage"/>
+        /// for the recommended workaround (invoke via a delegate).
+        /// </summary>
+        public bool InliningRisk => DiagInfo != null && DiagInfo.InliningRisk;
 
         public MethodHook(MethodBase targetMethod, MethodBase hookMethod)
         {
@@ -445,13 +475,65 @@ namespace DynamicHook
             }
             _needsGenericAdapter = _targetMethod.IsGenericMethod;
             hookDiagInfo.NeedsGenericAdapter = _needsGenericAdapter;
-            // Resolve to the hook's real JIT code entry so that patched call sites
-            // jump directly to the hook body. Using the precode address would route
-            // the call through the hook's own fixup thunk, which clobbers RDX (moves
-            // arg2 to R8 and loads the generic dict into RDX) and breaks the standard
-            // calling convention expected by the hook body.
-            IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(functionPointer2);
-            if (intPtr == IntPtr.Zero) intPtr = functionPointer2;
+            // Resolve the hook method's entry point for use as the patch jump target.
+            //
+            // We try ResolveRealEntry first for ALL methods. If the result looks
+            // like real JIT code (function prologue), we use it directly — this
+            // avoids the fixup helper entirely and is the safest option.
+            //
+            // If ResolveRealEntry does NOT return JIT code (e.g., it returned a
+            // fixup helper address because the precode wasn't backpatched), we
+            // fall back to the precode address. The FixupPrecode's FF 25 only
+            // sets R10 (MethodDesc) via MOV R10, [rip+disp] and does NOT touch
+            // parameter registers (RCX, RDX, R8, R9). On .NET 8, the fixup
+            // helper can identify the method from the precode's own data
+            // structures, so the precode address is a safe fallback.
+            //
+            // For GENERIC methods, the adapter trampoline shifts registers
+            // before jumping to the hook, so we need the JIT code address
+            // (not the precode address). ResolveRealEntry follows the
+            // precode → fixup table chain to find it.
+            IntPtr intPtr;
+            IntPtr resolved = MethodEntryResolver.ResolveRealEntry(functionPointer2);
+            // Resolve the target method's JIT code address. When the hook method's
+            // precode is NOT backpatched (e.g., when tiered compilation is disabled
+            // — which happens when a debugger is attached), ResolveRealEntry may
+            // follow the hook's precode → fixup helper chain and end up at the
+            // TARGET method's JIT code address. Using that as the jump target
+            // creates an infinite loop (target JIT code is E9-patched to jump
+            // back to the same address). Detect and prevent this.
+            IntPtr targetJitCode = MethodEntryResolver.ResolveRealEntry(functionPointer);
+            // Save the target's JIT code address BEFORE slot replacement.
+            // InstallSecondaryJitPatch reuses this instead of re-resolving,
+            // because ResolveRealEntry called after slot replacement would
+            // follow the modified MethodTable slot and resolve to the hook's
+            // address — creating an infinite loop (debug mode / tiered-off).
+            _targetJitCode = targetJitCode;
+            if (_needsGenericAdapter)
+            {
+                intPtr = resolved;
+                if (intPtr == IntPtr.Zero || intPtr == targetJitCode) intPtr = functionPointer2;
+            }
+            else if (resolved != IntPtr.Zero && resolved != functionPointer2
+                     && resolved != targetJitCode
+                     && LooksLikeRealJitCode(resolved))
+            {
+                // Resolved entry is real JIT code — use it directly to avoid
+                // the fixup helper entirely.
+                intPtr = resolved;
+            }
+            else
+            {
+                // Resolved entry is fixup helper, zero, or collides with the
+                // target's JIT code — fall back to precode. The precode's FF 25
+                // will route through the fixup helper, which backpatches the
+                // precode and jumps to the hook's real JIT code on first call.
+                intPtr = functionPointer2;
+            }
+            // Record hook precode diagnostics for troubleshooting.
+            hookDiagInfo.HookPrecodeAddr = functionPointer2;
+            hookDiagInfo.HookPrecodeBytes = MemOps.ReadBytesSafe(functionPointer2, 32);
+            hookDiagInfo.HookResolvedEntry = intPtr;
             if (NeedsGenericAdapter())
             {
                 // On x64, generic instance methods pass the generic dictionary in
@@ -485,7 +567,95 @@ namespace DynamicHook
             // CallOriginal can correctly restore/invoke/reapply instead of throwing.
             _isInstalled = true;
             InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
+            // Post-install verification: on .NET 8+, tiered promotion may
+            // replace the precode DURING or shortly AFTER patch installation,
+            // orphaning our patches. Detect this by re-checking
+            // GetFunctionPointer() and the precode's first byte.
+            if (Environment.Version.Major >= 8)
+            {
+                IntPtr postFp = _targetMethod.MethodHandle.GetFunctionPointer();
+                if (postFp != IntPtr.Zero && postFp != functionPointer)
+                {
+                    hookDiagInfo.PatchError += "; WARNING: Precode replaced during install (0x"
+                        + functionPointer.ToInt64().ToString("X") + " -> 0x"
+                        + postFp.ToInt64().ToString("X")
+                        + "). Patches may be orphaned. Consider re-installing the hook.";
+                }
+                else if (postFp == functionPointer)
+                {
+                    // Precode address unchanged — verify the E9 instruction
+                    // patch is still in place.
+                    byte[] verify = MemOps.ReadBytesSafe(functionPointer, 2);
+                    if (verify != null && verify.Length >= 1 && verify[0] != 0xE9)
+                    {
+                        hookDiagInfo.PatchError += "; WARNING: Precode E9 patch lost after install"
+                            + " (first byte=0x" + verify[0].ToString("X2")
+                            + "). Tiered promotion may have overwritten the precode.";
+                    }
+                }
+            }
+            EvaluateInliningRisk(hookDiagInfo);
             DiagInfo = hookDiagInfo;
+        }
+
+        /// <summary>
+        /// Detects whether the hook is at risk of being bypassed by JIT inlining.
+        ///
+        /// When the patch is applied to raw JIT code (PatchTarget == "JitCode",
+        /// i.e. GetFunctionPointer returned the JIT code directly with no precode),
+        /// the legacy .NET Framework 4.x JIT64 may inline the target method's body
+        /// into its callers. An inlined call contains no CALL instruction, so the
+        /// patch is never reached and the hook does not trigger for direct calls.
+        /// This most commonly affects small static methods (e.g. DateTime.Compare).
+        ///
+        /// This is informational only — the hook still works for non-inlined call
+        /// sites (delegate invocations, MethodInfo.Invoke, callers too large to
+        /// inline). The recommended workaround is to invoke the target method
+        /// through a delegate (Func&lt;...&gt;), which the JIT cannot inline.
+        /// </summary>
+        private void EvaluateInliningRisk(HookDiagInfo diag)
+        {
+            if (diag == null) return;
+            string target = diag.PatchTarget ?? "";
+            if (!target.StartsWith("JitCode", StringComparison.Ordinal))
+            {
+                // Precode / Slot patches funnel all calls through a single entry
+                // point; inlining is not a concern there.
+                return;
+            }
+
+            int ilSize = -1;
+            try
+            {
+                MethodBody body = (_targetMethod as MethodInfo)?.GetMethodBody();
+                if (body != null)
+                {
+                    byte[] il = body.GetILAsByteArray();
+                    if (il != null) ilSize = il.Length;
+                }
+            }
+            catch
+            {
+                // Some methods (e.g. intrinsics, P/Invoke) have no IL body.
+            }
+
+            // The legacy JIT64 inlines methods whose IL is small (typically <= ~64
+            // bytes). Flag the risk when IL is small enough to be inlined. Even
+            // when IL size is unknown, the JitCode patch target itself is a risk
+            // signal on .NET Framework 4.x.
+            bool frameworkIsNetFx = Environment.Version.Major < 6;
+            bool smallIl = ilSize >= 0 && ilSize <= 64;
+            if (smallIl || (frameworkIsNetFx && ilSize < 0))
+            {
+                diag.InliningRisk = true;
+                diag.InliningRiskMessage = string.Format(
+                    "Patch is on raw JIT code (no precode). IL size={0}. " +
+                    "On .NET Framework 4.x the legacy JIT64 may inline this method " +
+                    "into callers, bypassing the hook for direct calls. " +
+                    "Workaround: invoke via a delegate (Func<...>) which the JIT " +
+                    "cannot inline, or mark the caller with [MethodImpl(NoInlining)].",
+                    ilSize < 0 ? "unknown" : ilSize.ToString());
+            }
         }
 
         private void PrepareMethod(MethodBase method)
@@ -629,6 +799,37 @@ namespace DynamicHook
                     // Fallback: MethodInfo.Invoke (may not backpatch precode on
                     // .NET Framework 4.x, but works on .NET 6+).
                     mi.Invoke(instance, methodArgs);
+                }
+
+                // On .NET 8+, force tiered compilation promotion by calling the
+                // method many times. Tiered promotion can invalidate patches
+                // applied to tier-0 JIT code — the CLR compiles new tier-1 code
+                // at a different address and updates the precode's data cell,
+                // orphaning our secondary JIT patch. Call sites that bypass the
+                // precode (calling JIT code directly) then miss the hook entirely.
+                // By forcing promotion BEFORE patching, we ensure ResolveRealEntry
+                // returns the stable tier-1 JIT code address, and our patches are
+                // applied to code that will not be promoted again.
+                if (Environment.Version.Major >= 8 && !mi.IsGenericMethod)
+                {
+                    for (int i = 0; i < 50; i++)
+                    {
+                        try
+                        {
+                            if (_originalDelegate != null)
+                                _originalDelegate.DynamicInvoke(invokeArgs);
+                            else
+                                mi.Invoke(instance, methodArgs);
+                        }
+                        catch
+                        {
+                            // Expected — dummy args may throw, but the call
+                            // counter for tiered promotion increments regardless.
+                        }
+                    }
+                    // Wait briefly for the background tier-1 JIT thread to
+                    // complete compilation and update the precode's data cell.
+                    System.Threading.Thread.Sleep(50);
                 }
             }
             catch
@@ -911,6 +1112,7 @@ namespace DynamicHook
             byte b2 = ptr[1];
             if (b == 0xFF && b2 == 0x25)
             {
+                diag.PatchTarget = "Precode";
                 bool flag = ptr[6] == 0x4C && ptr[7] == 0x8B && ptr[8] == 0x15 && ptr[13] == 0xFF && ptr[14] == 0x25;
                 // Read first FF 25's indirect target for diagnostics
                 int disp1 = *(int*)(ptr + 2);
@@ -997,21 +1199,49 @@ namespace DynamicHook
                     {
                         InstallSecondaryJitPatch(targetPtr, jumpTarget, diag);
                     }
+                    // Patch the FF 25's indirect target data cell. This catches
+                    // calls that go through the precode via the FF 25 instruction.
                     int num = 0;  // Always patch the first FF 25 (the normal call entry)
                     byte* ptr2 = ptr + num;
                     int num2 = *(int*)(ptr2 + 2);
                     long num3 = targetPtr.ToInt64() + num + 6 + num2;
-                    _patchType = 1;
-                    _patchAddress = targetPtr;
                     _indirectTargetLoc = new IntPtr(num3);
                     _originalIndirectTarget = new IntPtr(*(long*)num3);
                     MemOps.WriteInt64Cell(_indirectTargetLoc, jumpTarget.ToInt64());
-                    diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode) + JIT(E9)" : "Indirect(FF 25) + JIT(E9)");
+                    _hasIndirectPatch = true;
+                    // ALSO patch the FF 25 instruction itself with a 5-byte E9
+                    // relative jump to a near trampoline. On .NET 8+, tiered
+                    // compilation promotion can OVERWRITE the data cell (target1)
+                    // to point to new tier-1 JIT code, silently bypassing the
+                    // data cell patch. The instruction patch is immune to this
+                    // because the CLR does not overwrite the precode instruction
+                    // during tiered promotion — it only updates the data cell.
+                    // The near trampoline does a 12-byte absolute jump to the hook.
+                    _nearTrampoline = Memory.AllocExecNear(targetPtr, 12);
+                    if (_nearTrampoline != IntPtr.Zero && _nearTrampoline != new IntPtr(-1))
+                    {
+                        byte[] absJump = Jumper.BuildAbsJumpX64(jumpTarget);
+                        MemOps.WriteBytes(_nearTrampoline, absJump);
+                        _patchType = 2;
+                        _patchAddress = targetPtr;
+                        _originalBytes = MemOps.ReadBytes(targetPtr, 6);
+                        byte[] relJump = Jumper.BuildRelJump(targetPtr, _nearTrampoline);
+                        MemOps.WriteBytesProtected(targetPtr, relJump);
+                        diag.PatchType = "Instr(E9) + Indirect(FF 25 data) + JIT(E9)";
+                    }
+                    else
+                    {
+                        // Fallback: data cell patch only (less robust on .NET 8+)
+                        _patchType = 1;
+                        diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode) + JIT(E9)" : "Indirect(FF 25) + JIT(E9)");
+                        diag.PatchError += "; NearTrampoline alloc failed, data-cell patch only";
+                    }
                     diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
                 }
             }
             else if (b == 0xE8 || b == 0xE9)
             {
+                diag.PatchTarget = "Precode";
                 // E8/E9 precode: the precode jumps to either the fixup thunk
                 // (generic methods on .NET Framework 4.x) or directly to JIT code
                 // (non-generic methods, or after backpatching on .NET 6+).
@@ -1115,8 +1345,26 @@ namespace DynamicHook
             }
             else if (!MethodEntryResolver.IsJump(targetPtr))
             {
+                // The address returned by GetFunctionPointer() is raw JIT code
+                // (no precode detected). On .NET Framework 4.x, PrepareMethod
+                // causes GetFunctionPointer() to return the JIT code entry point
+                // directly — the bytes typically start with a 5-byte NOP pad
+                // (0F 1F 44 00 00) for hot-patching, followed by the function
+                // prologue. Patching here intercepts all non-inlined CALLs to
+                // this address.
+                //
+                // LIMITATION: If the JIT inlines the target method into its
+                // callers (common for small methods like DateTime.Compare on
+                // .NET Framework 4.x), there is no CALL instruction to
+                // intercept and the hook will not trigger. To verify the hook
+                // works, call the method via a delegate (Func<...>) which the
+                // JIT cannot inline.
+                diag.PatchTarget = "JitCode";
                 _patchType = 3;
                 _patchAddress = targetPtr;
+                // Save full 32-byte original for potential CallOriginal trampoline.
+                _innerCodeAddress = targetPtr;
+                _innerCodeOriginalBytesFull = MemOps.ReadBytesSafe(targetPtr, 32);
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                 diag.PatchType = "JitCode(12-byte)";
                 diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, 16);
@@ -1126,14 +1374,18 @@ namespace DynamicHook
                 IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(targetPtr);
                 if (intPtr != IntPtr.Zero && intPtr != targetPtr && !MethodEntryResolver.IsJump(intPtr))
                 {
+                    diag.PatchTarget = "JitCode(resolved)";
                     _patchType = 3;
                     _patchAddress = intPtr;
+                    _innerCodeAddress = intPtr;
+                    _innerCodeOriginalBytesFull = MemOps.ReadBytesSafe(intPtr, 32);
                     _originalBytes = Jumper.Install(intPtr, jumpTarget);
                     diag.PatchType = "ResolvedJitCode(12-byte)";
                     diag.InstalledBytes = MemOps.ReadBytesSafe(intPtr, 16);
                 }
                 else
                 {
+                    diag.PatchTarget = "None";
                     diag.PatchType = "None(relies on slot replacement)";
                 }
             }
@@ -1261,7 +1513,21 @@ namespace DynamicHook
         {
             try
             {
-                IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(targetPtr);
+                // Prefer the target JIT address resolved in Install() BEFORE slot
+                // replacement. Calling ResolveRealEntry(targetPtr) here would follow
+                // the now-modified MethodTable slot (which points to the hook) and
+                // resolve to the HOOK's JIT code — patching that creates an infinite
+                // loop. This happens when tiered compilation is disabled (debugger
+                // attached / DOTNET_TieredCompilation=0) and precodes are not
+                // backpatched, so the fixup helper reads the slot to find the entry.
+                IntPtr intPtr = _targetJitCode;
+                // Fall back to live resolution only if the saved value is unusable
+                // (e.g. .NET Framework 4.x E8 precode where ResolveRealEntry returns
+                // the input unchanged, so _targetJitCode == targetPtr).
+                if (intPtr == IntPtr.Zero || intPtr == targetPtr)
+                {
+                    intPtr = MethodEntryResolver.ResolveRealEntry(targetPtr);
+                }
                 // .NET Framework 4.x E8 precode: ResolveRealEntry treats E8+5E as a
                 // precode sentinel and returns without following. Manually follow
                 // the E8 rel32 to the fixup code, then extract the JIT code address.
@@ -1287,6 +1553,17 @@ namespace DynamicHook
                 if (intPtr == IntPtr.Zero || intPtr == targetPtr)
                 {
                     diag.PatchError += "; cannot resolve JIT entry for secondary patch";
+                    return;
+                }
+                // Safety guard: if the resolved JIT address equals the jump target
+                // (the hook's entry / adapter trampoline), we would be patching the
+                // hook's own code with an E9 jump to itself — an infinite loop.
+                // This can happen when ResolveRealEntry follows the fixup chain to
+                // the hook. Skip the secondary patch entirely in that case; the
+                // precode + slot patches are sufficient to redirect calls.
+                if (intPtr == jumpTarget)
+                {
+                    diag.PatchError += "; skipped secondary JIT patch: resolved addr == jumpTarget (infinite loop guard)";
                     return;
                 }
                 // On .NET Framework 4.x, the resolved entry may be the "fixup code" that
@@ -1364,6 +1641,21 @@ namespace DynamicHook
                 if (b0 == 0xE8 && p[5] == 0xE9) return false;
                 // Another PRESTUB variant: starts with E8 or E9 (call/jmp to helper)
                 if (b0 == 0xE8 || b0 == 0xE9) return false;
+                // Fixup helper pattern: 48 B8 <imm64> FF E0 (MOV RAX, addr; JMP RAX)
+                // This is NOT JIT code — it's the precode fixup thunk that calls
+                // Prestub. On .NET 8+, PrepareMethod may NOT backpatch the precode,
+                // leaving target1 pointing to this fixup helper. If we mistake it
+                // for JIT code, we use it as the jump target, which can cause
+                // infinite loops or silent failures on .NET 8.
+                if (b0 == 0x48 && b1 == 0xB8 && Memory.IsReadable(addr, 12))
+                {
+                    if (p[10] == 0xFF && p[11] == 0xE0) return false;  // JMP RAX
+                }
+                // Fixup helper variant: 49 B8 <imm64> 41 FF E0 (MOV R8, addr; JMP R8)
+                if (b0 == 0x49 && b1 == 0xB8 && Memory.IsReadable(addr, 13))
+                {
+                    if (p[10] == 0x41 && p[11] == 0xFF && p[12] == 0xE0) return false;
+                }
                 // Common x64 function prologues:
                 // 48 83 EC xx     SUB RSP, imm8
                 // 48 81 EC xx..   SUB RSP, imm32
@@ -1538,6 +1830,14 @@ namespace DynamicHook
                     diag.PatchError += "; cannot patch null JIT entry";
                     return;
                 }
+                // Defense-in-depth: never patch the hook's own entry point.
+                // This would create an E9 jump from the hook to itself — an
+                // infinite loop that hangs the process.
+                if (intPtr == jumpTarget)
+                {
+                    diag.PatchError += "; skipped InstallSecondaryJitPatchAt: intPtr == jumpTarget (infinite loop guard)";
+                    return;
+                }
                 diag.JitCodeAddr = intPtr;
                 diag.JitCodeOriginalBytes = MemOps.ReadBytesSafe(intPtr, 32);
                 // Save the full 32-byte copy BEFORE the 5-byte E9 patch is applied.
@@ -1647,6 +1947,14 @@ namespace DynamicHook
                 if (jitAddr == IntPtr.Zero)
                 {
                     diag.PatchError += "; cannot resolve JIT entry for x86 secondary patch";
+                    return;
+                }
+
+                // Safety guard: if the resolved JIT address equals the jump target,
+                // patching it would create an infinite loop. Skip the secondary patch.
+                if (jitAddr == jumpTarget)
+                {
+                    diag.PatchError += "; skipped x86 secondary JIT patch: resolved addr == jumpTarget (infinite loop guard)";
                     return;
                 }
 
@@ -2503,6 +2811,45 @@ namespace DynamicHook
                 }
             }
 
+            // Path 1a: Call the original JIT code directly via delegate*.
+            // On .NET 8+, the delegate's Invoke method may dispatch through
+            // the MethodTable slot rather than _methodPtrAux (the precode).
+            // If RestoreAll fails to restore the slot (observed on .NET 8 for
+            // CoreLib methods like string.Compare), the delegate's Invoke
+            // re-enters the hook, causing an infinite loop.
+            //
+            // Calling _targetJitCode directly bypasses BOTH the precode and
+            // the MethodTable slot. After RestoreAll, the secondary JIT patch
+            // at _targetJitCode is restored to original bytes, so the call
+            // reaches the real method body. delegate* (managed calling convention)
+            // keeps the thread in cooperative GC mode for proper object-reference
+            // tracking. Only works for reference-type parameters (CanUseTrampoline).
+            if (_targetJitCode != IntPtr.Zero && CanUseTrampoline(methodInfo))
+            {
+                RestoreAll();
+                try
+                {
+                    object[] jitArgs = new object[argCount];
+                    int slot = 0;
+                    if (!methodInfo.IsStatic)
+                    {
+                        jitArgs[slot++] = instance;
+                    }
+                    if (args != null)
+                    {
+                        for (int i = 0; i < args.Length; i++)
+                        {
+                            jitArgs[slot++] = args[i];
+                        }
+                    }
+                    return InvokeViaFptr(_targetJitCode, jitArgs, isVoid, returnType);
+                }
+                finally
+                {
+                    ReapplyAll();
+                }
+            }
+
             // Path 1: cached delegate's Invoke via function pointer.
             // For generic methods, DynamicInvoke goes through
             // RuntimeMethodHandle.InvokeMethod which crashes (0x80131506).
@@ -2516,10 +2863,10 @@ namespace DynamicHook
                 try
                 {
                     // delegate*<object, ...> passes all args as object references.
-                    // This works for reference types but NOT for value types (int,
-                    // bool, etc.) — a boxed object pointer is passed instead of the
-                    // raw value, corrupting the parameter. Fall back to DynamicInvoke
-                    // (which correctly boxes/unboxes) when value-type params exist.
+                    // This works for reference-type parameters. For value-type
+                    // parameters, fall back to DynamicInvoke (which correctly
+                    // boxes/unboxes). Value-type RETURNS are handled by
+                    // InvokeViaFptr via delegate*<..., IntPtr>.
                     if (_delegateInvokeFptr != IntPtr.Zero && CanUseTrampoline(methodInfo))
                     {
                         return InvokeViaDelegateFptr(methodInfo, instance, args);
@@ -2565,16 +2912,14 @@ namespace DynamicHook
         }
 
         /// <summary>
-        /// Checks whether all parameters and the return type are reference types
-        /// (or IntPtr/UIntPtr), which is required for the delegate* trampoline path.
+        /// Checks whether all PARAMETERS are reference types (or IntPtr/UIntPtr),
+        /// which is required for the delegate* trampoline path. The return type
+        /// can be any type: reference returns use delegate*&lt;..., object&gt;,
+        /// value-type returns use delegate*&lt;..., IntPtr&gt; (reading RAX) or
+        /// delegate*&lt;..., double&gt; (reading XMM0 for float/double).
         /// </summary>
         private static bool CanUseTrampoline(MethodInfo methodInfo)
         {
-            Type returnType = methodInfo.ReturnType;
-            if (returnType != typeof(void) && !IsReferenceCompatible(returnType))
-            {
-                return false;
-            }
             foreach (ParameterInfo p in methodInfo.GetParameters())
             {
                 if (!IsReferenceCompatible(p.ParameterType))
@@ -2688,7 +3033,7 @@ namespace DynamicHook
             // transition, corrupting object references on compaction.
             if (Environment.Version.Major >= 5)
             {
-                return InvokeViaFptr(_callOrigTrampoline, flatArgs, isVoid);
+                return InvokeViaFptr(_callOrigTrampoline, flatArgs, isVoid, returnType);
             }
 
             // Fallback for older runtimes: IntPtr delegate (GC-unsafe, may crash for
@@ -2704,35 +3049,99 @@ namespace DynamicHook
         /// Requires .NET 5+ runtime; the containing methods are only JIT-compiled when
         /// actually called on .NET 5+, so they never fail to load on older runtimes.
         /// </summary>
-        private static unsafe object InvokeViaFptr(IntPtr fptr, object[] args, bool isVoid)
+        private static unsafe object InvokeViaFptr(IntPtr fptr, object[] args, bool isVoid, Type returnType)
         {
+            // Categorize the return type:
+            // - void: no return value
+            // - refReturn: reference type (GC-tracked in RAX)
+            // - floatReturn / doubleReturn: floating-point (returned in XMM0)
+            // - valueReturn: other value types ≤ 8 bytes (returned in RAX, not GC-tracked)
+            bool refReturn = !isVoid && !returnType.IsValueType;
+            bool floatReturn = returnType == typeof(float);
+            bool doubleReturn = returnType == typeof(double);
+            bool valueReturn = !isVoid && returnType.IsValueType && !floatReturn && !doubleReturn;
+
+            // Value types > 8 bytes use a hidden pointer parameter (RCX on x64),
+            // which shifts all other arguments and breaks the delegate* ABI.
+            if (valueReturn)
+            {
+                int sz;
+                try { sz = Marshal.SizeOf(returnType); }
+                catch { sz = 16; }
+                if (sz > 8)
+                {
+                    throw new NotSupportedException(
+                        "delegate* path does not support value-type returns > 8 bytes: " + returnType);
+                }
+            }
+
             object result;
             switch (args.Length)
             {
                 case 0:
                     if (isVoid) { ((delegate*<void>)fptr)(); result = null; }
-                    else result = ((delegate*<object>)fptr)();
+                    else if (refReturn) result = ((delegate*<object>)fptr)();
+                    else if (floatReturn) result = ((delegate*<float>)fptr)();
+                    else if (doubleReturn) result = ((delegate*<double>)fptr)();
+                    else result = BoxValueResult(((delegate*<IntPtr>)fptr)(), returnType);
                     break;
                 case 1:
                     if (isVoid) { ((delegate*<object, void>)fptr)(args[0]); result = null; }
-                    else result = ((delegate*<object, object>)fptr)(args[0]);
+                    else if (refReturn) result = ((delegate*<object, object>)fptr)(args[0]);
+                    else if (floatReturn) result = ((delegate*<object, float>)fptr)(args[0]);
+                    else if (doubleReturn) result = ((delegate*<object, double>)fptr)(args[0]);
+                    else result = BoxValueResult(((delegate*<object, IntPtr>)fptr)(args[0]), returnType);
                     break;
                 case 2:
                     if (isVoid) { ((delegate*<object, object, void>)fptr)(args[0], args[1]); result = null; }
-                    else result = ((delegate*<object, object, object>)fptr)(args[0], args[1]);
+                    else if (refReturn) result = ((delegate*<object, object, object>)fptr)(args[0], args[1]);
+                    else if (floatReturn) result = ((delegate*<object, object, float>)fptr)(args[0], args[1]);
+                    else if (doubleReturn) result = ((delegate*<object, object, double>)fptr)(args[0], args[1]);
+                    else result = BoxValueResult(((delegate*<object, object, IntPtr>)fptr)(args[0], args[1]), returnType);
                     break;
                 case 3:
                     if (isVoid) { ((delegate*<object, object, object, void>)fptr)(args[0], args[1], args[2]); result = null; }
-                    else result = ((delegate*<object, object, object, object>)fptr)(args[0], args[1], args[2]);
+                    else if (refReturn) result = ((delegate*<object, object, object, object>)fptr)(args[0], args[1], args[2]);
+                    else if (floatReturn) result = ((delegate*<object, object, object, float>)fptr)(args[0], args[1], args[2]);
+                    else if (doubleReturn) result = ((delegate*<object, object, object, double>)fptr)(args[0], args[1], args[2]);
+                    else result = BoxValueResult(((delegate*<object, object, object, IntPtr>)fptr)(args[0], args[1], args[2]), returnType);
                     break;
                 case 4:
                     if (isVoid) { ((delegate*<object, object, object, object, void>)fptr)(args[0], args[1], args[2], args[3]); result = null; }
-                    else result = ((delegate*<object, object, object, object, object>)fptr)(args[0], args[1], args[2], args[3]);
+                    else if (refReturn) result = ((delegate*<object, object, object, object, object>)fptr)(args[0], args[1], args[2], args[3]);
+                    else if (floatReturn) result = ((delegate*<object, object, object, object, float>)fptr)(args[0], args[1], args[2], args[3]);
+                    else if (doubleReturn) result = ((delegate*<object, object, object, object, double>)fptr)(args[0], args[1], args[2], args[3]);
+                    else result = BoxValueResult(((delegate*<object, object, object, object, IntPtr>)fptr)(args[0], args[1], args[2], args[3]), returnType);
                     break;
                 default:
                     throw new NotSupportedException("delegate* path supports at most 4 arguments");
             }
             return result;
+        }
+
+        /// <summary>
+        /// Boxes a raw IntPtr return value (from delegate*&lt;..., IntPtr&gt;) into
+        /// the correct value type. On x64, value-type returns ≤ 8 bytes are in RAX;
+        /// reading as IntPtr gives the full 64-bit register, and we truncate/convert
+        /// to the target type.
+        /// </summary>
+        private static object BoxValueResult(IntPtr rawResult, Type returnType)
+        {
+            long val = rawResult.ToInt64();
+            if (returnType == typeof(int)) return (int)val;
+            if (returnType == typeof(uint)) return (uint)val;
+            if (returnType == typeof(long)) return val;
+            if (returnType == typeof(ulong)) return (ulong)val;
+            if (returnType == typeof(short)) return (short)val;
+            if (returnType == typeof(ushort)) return (ushort)val;
+            if (returnType == typeof(byte)) return (byte)val;
+            if (returnType == typeof(sbyte)) return (sbyte)val;
+            if (returnType == typeof(bool)) return val != 0;
+            if (returnType == typeof(char)) return (char)val;
+            if (returnType == typeof(IntPtr)) return rawResult;
+            if (returnType == typeof(UIntPtr)) return (UIntPtr)val;
+            if (returnType.IsEnum) return Enum.ToObject(returnType, val);
+            return Convert.ChangeType(val, returnType);
         }
 
         /// <summary>
@@ -2771,7 +3180,7 @@ namespace DynamicHook
                 }
             }
 
-            return InvokeViaFptr(_delegateInvokeFptr, invokeArgs, isVoid);
+            return InvokeViaFptr(_delegateInvokeFptr, invokeArgs, isVoid, methodInfo.ReturnType);
         }
 
         /// <summary>
@@ -2907,6 +3316,13 @@ namespace DynamicHook
                     }
                     break;
             }
+            // Restore the indirect data cell independently when _hasIndirectPatch
+            // is set (used with _patchType=2 E9 instruction patch on FF 25 precode).
+            // This is NOT needed for _patchType=1 (case 1 already handles it).
+            if (_hasIndirectPatch && _patchType != 1 && _indirectTargetLoc != IntPtr.Zero)
+            {
+                SafeTry("Restore indirectTargetLoc (hasIndirect)", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _originalIndirectTarget));
+            }
             if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero && _secondaryJitOriginalBytes != null)
             {
                 SafeTry("Restore secondaryJit", () => Jumper.Restore(_secondaryJitAddress, _secondaryJitOriginalBytes));
@@ -2968,6 +3384,13 @@ namespace DynamicHook
                         SafeTry("Reapply patchAddress case3", () => Jumper.WriteJump(_patchAddress, _newSlotValue));
                     }
                     break;
+            }
+            // Reapply the indirect data cell independently when _hasIndirectPatch
+            // is set (used with _patchType=2 E9 instruction patch on FF 25 precode).
+            // This is NOT needed for _patchType=1 (case 1 already handles it).
+            if (_hasIndirectPatch && _patchType != 1 && _indirectTargetLoc != IntPtr.Zero)
+            {
+                SafeTry("Reapply indirectTargetLoc (hasIndirect)", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _newSlotValue));
             }
             if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero)
             {

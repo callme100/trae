@@ -55,6 +55,47 @@ namespace DynamicHook
 
         public byte[] CallOrigTrampolineBytes;
 
+        /// <summary>
+        /// Indicates what kind of code the patch was applied to:
+        /// "Precode" — the patch targets a precode (FF 25, E8, E9, etc.).
+        /// "JitCode" — the patch targets the raw JIT code entry point (no precode
+        ///             detected). On .NET Framework 4.x, GetFunctionPointer()
+        ///             may return the JIT code directly after PrepareMethod.
+        ///             In this case, direct calls to small methods may be JIT-inlined,
+        ///             bypassing the patch. Use a delegate call to prevent inlining.
+        /// "Slot"    — the patch targets a MethodTable slot.
+        /// "None"    — no code patch was installed (relies on slot replacement).
+        /// </summary>
+        public string PatchTarget;
+
+        /// <summary>
+        /// True when the patch was applied to raw JIT code (PatchTarget == "JitCode")
+        /// AND the target method's IL is small enough to be JIT-inlined. On the
+        /// legacy .NET Framework 4.x JIT64, small methods (e.g. DateTime.Compare)
+        /// are aggressively inlined into their callers — the inlined copy contains
+        /// no CALL instruction, so the hook cannot intercept direct calls. This
+        /// flag is informational: the hook still works for non-inlined call sites
+        /// (delegate invocations, reflection, large callers). See
+        /// <see cref="InliningRiskMessage"/> for the recommended workaround.
+        /// </summary>
+        public bool InliningRisk;
+
+        /// <summary>
+        /// Human-readable explanation set when <see cref="InliningRisk"/> is true,
+        /// including the target method's IL size and the workaround (invoke the
+        /// method through a delegate, which the JIT cannot inline).
+        /// </summary>
+        public string InliningRiskMessage;
+
+        /// <summary>Hook method's precode address (from GetFunctionPointer).</summary>
+        public IntPtr HookPrecodeAddr;
+
+        /// <summary>First 32 bytes at the hook method's precode address.</summary>
+        public byte[] HookPrecodeBytes;
+
+        /// <summary>Hook method's resolved entry (what ResolveRealEntry returned).</summary>
+        public IntPtr HookResolvedEntry;
+
         public override string ToString()
         {
             StringBuilder stringBuilder = new StringBuilder();
@@ -72,6 +113,13 @@ namespace DynamicHook
                 stringBuilder.AppendLine("Slot error:    " + SlotError);
             }
             stringBuilder.AppendLine("Patch type:    " + (PatchType ?? "none"));
+            stringBuilder.AppendLine("Patch target:  " + (PatchTarget ?? "unknown"));
+            if (InliningRisk)
+            {
+                stringBuilder.AppendLine("InliningRisk:  True");
+                if (!string.IsNullOrEmpty(InliningRiskMessage))
+                    stringBuilder.AppendLine("               " + InliningRiskMessage);
+            }
             if (!string.IsNullOrEmpty(PatchError))
             {
                 stringBuilder.AppendLine("Patch error:   " + PatchError);

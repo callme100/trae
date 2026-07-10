@@ -1,0 +1,13 @@
+c:\trae\DynamicHook.Tests\bin\Debug\net472\DynamicHook.Tests.exe.config
+c:\trae\DynamicHook.Tests\bin\Debug\net472\DynamicHook.Tests.exe
+c:\trae\DynamicHook.Tests\bin\Debug\net472\DynamicHook.Tests.pdb
+c:\trae\DynamicHook.Tests\bin\Debug\net472\DynamicHook.dll
+c:\trae\DynamicHook.Tests\bin\Debug\net472\DynamicHook.pdb
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.csproj.AssemblyReference.cache
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.GeneratedMSBuildEditorConfig.editorconfig
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.AssemblyInfoInputs.cache
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.AssemblyInfo.cs
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.csproj.CoreCompileInputs.cache
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicH.DC147018.Up2Date
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.exe
+c:\trae\DynamicHook.Tests\obj\Debug\net472\DynamicHook.Tests.pdb
