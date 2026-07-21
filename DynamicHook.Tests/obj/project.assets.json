@@ -126,11 +126,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "c:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
+      "projectUniqueName": "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
       "projectName": "DynamicHook.Tests",
-      "projectPath": "c:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
+      "projectPath": "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
       "packagesPath": "C:\\Users\\test\\.nuget\\packages\\",
-      "outputPath": "c:\\trae\\DynamicHook.Tests\\obj\\",
+      "outputPath": "C:\\trae\\DynamicHook.Tests\\obj\\",
       "projectStyle": "PackageReference",
       "crossTargeting": true,
       "fallbackFolders": [
@@ -156,8 +156,8 @@
           "framework": "net10.0",
           "targetAlias": "net10.0",
           "projectReferences": {
-            "c:\\trae\\DynamicHook\\DynamicHook.csproj": {
-              "projectPath": "c:\\trae\\DynamicHook\\DynamicHook.csproj"
+            "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+              "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
             }
           }
         },
@@ -165,8 +165,8 @@
           "framework": "net472",
           "targetAlias": "net472",
           "projectReferences": {
-            "c:\\trae\\DynamicHook\\DynamicHook.csproj": {
-              "projectPath": "c:\\trae\\DynamicHook\\DynamicHook.csproj"
+            "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+              "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
             }
           }
         },
@@ -174,8 +174,8 @@
           "framework": "net6.0",
           "targetAlias": "net6.0",
           "projectReferences": {
-            "c:\\trae\\DynamicHook\\DynamicHook.csproj": {
-              "projectPath": "c:\\trae\\DynamicHook\\DynamicHook.csproj"
+            "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+              "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
             }
           }
         },
@@ -183,8 +183,8 @@
           "framework": "net8.0",
           "targetAlias": "net8.0",
           "projectReferences": {
-            "c:\\trae\\DynamicHook\\DynamicHook.csproj": {
-              "projectPath": "c:\\trae\\DynamicHook\\DynamicHook.csproj"
+            "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+              "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
             }
           }
         }

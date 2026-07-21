@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -20,6 +21,17 @@ namespace DynamicHook
         private List<IntPtr> _slotAddresses;
 
         private IntPtr _originalSlotValue;
+
+        /// <summary>
+        /// Per-slot original values saved BEFORE patching, parallel to
+        /// <see cref="_slotAddresses"/>. SlotPatcher.FindSlots can find slots
+        /// holding DIFFERENT original values (e.g. the first precode address AND
+        /// the boxed→unboxed thunk address for value-type instance methods).
+        /// Restoring all slots to a single shared value corrupts the slots that
+        /// had a different original, creating a circular dispatch loop between
+        /// the two precodes. This list preserves each slot's true original.
+        /// </summary>
+        private List<IntPtr> _originalSlotValues;
 
         private IntPtr _newSlotValue;
 
@@ -148,6 +160,17 @@ namespace DynamicHook
         private int _delegateFlatArgCount;
 
         private bool _needsGenericAdapter;
+
+        /// <summary>
+        /// Re-entrancy guard for CallOriginal. When CallOriginal is executing
+        /// (between RestoreAll and ReapplyAll), the patches are temporarily
+        /// removed. If the delegate's Invoke method dispatches through the
+        /// MethodTable slot (which may still be patched if RestoreAll failed
+        /// to restore it — observed on .NET 8+ for CoreLib methods), the hook
+        /// is re-entered, causing infinite recursion. This flag detects such
+        /// re-entrancy and throws instead of crashing with AccessViolationException.
+        /// </summary>
+        private bool _inCallOriginal;
 
         private bool _isInstalled;
 
@@ -301,6 +324,26 @@ namespace DynamicHook
                         hookDiagInfo.AdapterBytes = adapterBytes;
                         intPtr = _hookAdapterTrampoline; // all patches now jump to adapter → hook
                     }
+                }
+            }
+            if (NeedsValueTypeAdapter())
+            {
+                // Value-type instance methods receive 'this' as a managed pointer
+                // (byref) in RCX: RCX = &T. A static hook with signature Hook(T self)
+                // expects the value by-value in RCX. Build an adapter that dereferences
+                // the pointer (MOV RCX, [RCX]) before jumping to the hook, converting
+                // byref → byval. Only for structs ≤ 8 bytes (single register).
+                byte[] adapterBytes = BuildValueTypeAdapterBytes();
+                int trampSize = adapterBytes.Length + 12; // adapter + MOV RAX,imm64; JMP RAX
+                _hookAdapterTrampoline = Memory.AllocExecNear(intPtr, trampSize);
+                if (_hookAdapterTrampoline != IntPtr.Zero && _hookAdapterTrampoline != new IntPtr(-1))
+                {
+                    MemOps.WriteBytes(_hookAdapterTrampoline, adapterBytes);
+                    byte[] jumpBytes = Jumper.BuildAbsJumpX64(intPtr);
+                    MemOps.WriteBytes(_hookAdapterTrampoline + adapterBytes.Length, jumpBytes);
+                    hookDiagInfo.AdapterAddr = _hookAdapterTrampoline;
+                    hookDiagInfo.AdapterBytes = adapterBytes;
+                    intPtr = _hookAdapterTrampoline; // all patches now jump to adapter → hook
                 }
             }
             _newSlotValue = intPtr;
@@ -463,6 +506,21 @@ namespace DynamicHook
             {
                 return;
             }
+            // Skip DynamicInvoke for value-type instance methods on .NET Framework 4.x.
+            // These methods typically have E8 precodes whose fixup code is a CLR helper
+            // (not the inline generic dictionary setup pattern), so we cannot extract
+            // the JIT code address to patch it. DynamicInvoke backpatches direct call
+            // sites to call JIT code directly, bypassing our precode patch entirely.
+            // By skipping DynamicInvoke, call sites remain un-backpatched and go through
+            // the precode (which we patch with E8→E9), triggering the hook.
+            // PrepareMethod (called earlier) already JIT-compiles non-generic methods.
+            if (Environment.Version.Major < 6
+                && !mi.IsStatic
+                && mi.DeclaringType != null
+                && mi.DeclaringType.IsValueType)
+            {
+                return;
+            }
             try
             {
                 ParameterInfo[] parameters = mi.GetParameters();
@@ -614,43 +672,80 @@ namespace DynamicHook
                 int extraForInstance = methodInfo.IsStatic ? 0 : 1;
                 int totalTypeArgs = parameters.Length + extraForInstance + (isVoid ? 0 : 1);
 
-                Type[] typeArgs = new Type[totalTypeArgs];
-                int idx = 0;
-                if (!methodInfo.IsStatic)
-                {
-                    typeArgs[idx++] = methodInfo.DeclaringType;
-                }
-                for (int i = 0; i < parameters.Length; i++)
-                {
-                    typeArgs[idx++] = parameters[i].ParameterType;
-                }
-                if (!isVoid)
-                {
-                    typeArgs[idx++] = returnType;
-                }
+                // For value-type instance methods, Delegate.CreateDelegate with
+                // Func<T,...> fails because the CLR passes 'this' as a managed
+                // pointer (byref), but Func<T,...> expects T byval. We use
+                // Expression.Lambda to create a delegate that boxes/unboxes
+                // automatically, providing a byval-compatible wrapper.
+                bool isValueTypeInstance = !methodInfo.IsStatic
+                    && methodInfo.DeclaringType != null
+                    && methodInfo.DeclaringType.IsValueType;
 
-                // Get the open delegate type (Func<...> or Action<...>)
-                string delegateName = isVoid ? "System.Action`" : "System.Func`";
-                Type openDelegateType = Type.GetType(delegateName + totalTypeArgs);
-                if (openDelegateType == null)
+                if (isValueTypeInstance)
                 {
-                    return;
-                }
-                Type delegateType = openDelegateType.MakeGenericType(typeArgs);
+                    // Build an Expression that calls the method via a boxed parameter.
+                    // The delegate accepts T byval (boxed in object for DynamicInvoke),
+                    // and the expression unboxes to byref before calling the method.
+                    ParameterExpression[] exprParams = new ParameterExpression[totalTypeArgs - (isVoid ? 0 : 1)];
+                    int pi = 0;
+                    ParameterExpression instanceParam = Expression.Parameter(methodInfo.DeclaringType, "instance");
+                    exprParams[pi++] = instanceParam;
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        exprParams[pi++] = Expression.Parameter(parameters[i].ParameterType, "p" + i);
+                    }
 
-                // Create an open delegate (null target). For instance methods, the
-                // instance is passed as the first argument when invoking the delegate.
-                _originalDelegate = Delegate.CreateDelegate(delegateType, null, methodInfo);
+                    // Call the method. For value-type instance methods, Expression.Call
+                    // automatically handles the byref 'this' conversion.
+                    Expression callExpr = Expression.Call(instanceParam, methodInfo, exprParams.Skip(1).Cast<Expression>());
+                    if (isVoid)
+                    {
+                        Type actionType = Expression.GetActionType(exprParams.Select(p => p.Type).ToArray());
+                        _originalDelegate = Expression.Lambda(actionType, callExpr, exprParams).Compile();
+                    }
+                    else
+                    {
+                        Type funcType = Expression.GetFuncType(exprParams.Select(p => p.Type).Append(returnType).ToArray());
+                        _originalDelegate = Expression.Lambda(funcType, callExpr, exprParams).Compile();
+                    }
+                }
+                else
+                {
+                    Type[] typeArgs = new Type[totalTypeArgs];
+                    int idx = 0;
+                    if (!methodInfo.IsStatic)
+                    {
+                        typeArgs[idx++] = methodInfo.DeclaringType;
+                    }
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        typeArgs[idx++] = parameters[i].ParameterType;
+                    }
+                    if (!isVoid)
+                    {
+                        typeArgs[idx++] = returnType;
+                    }
+
+                    // Get the open delegate type (Func<...> or Action<...>)
+                    string delegateName = isVoid ? "System.Action`" : "System.Func`";
+                    Type openDelegateType = Type.GetType(delegateName + totalTypeArgs);
+                    if (openDelegateType == null)
+                    {
+                        return;
+                    }
+                    Type delegateType = openDelegateType.MakeGenericType(typeArgs);
+
+                    // Create an open delegate (null target). For instance methods, the
+                    // instance is passed as the first argument when invoking the delegate.
+                    _originalDelegate = Delegate.CreateDelegate(delegateType, null, methodInfo);
+                }
 
                 // Record the flat argument count (instance + declared params).
                 _delegateFlatArgCount = parameters.Length + extraForInstance;
 
                 // Capture the function pointer of the delegate's Invoke method.
-                // Invoke is an instance method whose native arg count is
-                // _delegateFlatArgCount + 1 (the +1 is the delegate itself as 'this').
-                // It is non-generic, so GetFunctionPointer works and delegate* calls
-                // bypass RuntimeMethodHandle.InvokeMethod (avoiding 0x80131506).
-                MethodInfo invokeMethod = delegateType.GetMethod("Invoke");
+                Type actualDelegateType = _originalDelegate.GetType();
+                MethodInfo invokeMethod = actualDelegateType.GetMethod("Invoke");
                 if (invokeMethod == null)
                 {
                     _originalDelegate = null;
@@ -668,7 +763,7 @@ namespace DynamicHook
                 }
                 _delegateInvokeFptr = invokeHandle.GetFunctionPointer();
             }
-            catch
+            catch (Exception)
             {
                 _originalDelegate = null;
                 _delegateInvokeFptr = IntPtr.Zero;
@@ -720,9 +815,20 @@ namespace DynamicHook
         {
             if (_slotAddresses != null)
             {
-                foreach (IntPtr slotAddress in _slotAddresses)
+                // Use per-slot original values when available: SlotPatcher may find
+                // slots with DIFFERENT originals (precode addr vs boxed→unboxed
+                // thunk). Falling back to the shared _originalSlotValue would
+                // corrupt the thunk-pointing slot and loop forever on the next call.
+                int count = _slotAddresses.Count;
+                for (int i = 0; i < count; i++)
                 {
-                    SafeTry("RestoreSlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, _originalSlotValue));
+                    IntPtr slotAddress = _slotAddresses[i];
+                    IntPtr originalValue = (_originalSlotValues != null && i < _originalSlotValues.Count)
+                        ? _originalSlotValues[i]
+                        : _originalSlotValue;
+                    IntPtr captured = originalValue;
+                    IntPtr capturedSlot = slotAddress;
+                    SafeTry("RestoreSlot " + capturedSlot, () => SlotPatcher.ReplaceSlot(capturedSlot, captured));
                 }
             }
             RestoreCodePatch();

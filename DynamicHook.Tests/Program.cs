@@ -124,6 +124,7 @@ namespace DynamicHook.Tests
                 { "StreamReaderReadToEnd", HookTests.Test_StreamReaderReadToEnd },
                 { "ListConvertAll",    HookTests.Test_ListConvertAll },
                 { "ListConvertAllTieredStress", HookTests.Test_ListConvertAllTieredStress },
+                { "DateTimeToString",  HookTests.Test_DateTimeToString },
             };
 
         /// <summary>

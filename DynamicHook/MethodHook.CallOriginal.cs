@@ -12,6 +12,19 @@ namespace DynamicHook
             {
                 throw new InvalidOperationException("Hook is not installed");
             }
+            // Re-entrancy guard: if CallOriginal is already in progress on this
+            // hook instance, the delegate's Invoke method has re-entered the hook
+            // through a patched MethodTable slot (observed on .NET 8+ for CoreLib
+            // methods when tiered compilation is disabled, e.g., debugger attached).
+            // Throw instead of recursing into a stack overflow / AccessViolationException.
+            if (_inCallOriginal)
+            {
+                throw new InvalidOperationException(
+                    "CallOriginal re-entrancy detected: the delegate's Invoke method "
+                    + "dispatched through a patched slot and re-entered the hook. "
+                    + "This typically occurs on .NET 8+ with a debugger attached "
+                    + "(tiered compilation disabled). Use MethodInfo.Invoke path instead.");
+            }
             MethodInfo methodInfo = _targetMethod as MethodInfo;
             if (methodInfo == null)
             {
@@ -32,6 +45,9 @@ namespace DynamicHook
                 throw new NotSupportedException("CallOriginal supports at most 4 arguments; actual: " + argCount);
             }
 
+            _inCallOriginal = true;
+            try
+            {
             // Path 0: for generic methods, use RestoreAll + invoke + ReapplyAll.
             // Prefer the delegate's Invoke method (via delegate*) over MethodInfo.Invoke,
             // because RuntimeMethodHandle.InvokeMethod (used by MethodInfo.Invoke) does not
@@ -136,7 +152,19 @@ namespace DynamicHook
             // reflection entirely. The Invoke method is non-generic and sets
             // up the generic dictionary (R10) before calling the target.
             // MUST run on the SAME thread — see Path 0 comment for details.
-            if (_originalDelegate != null)
+            //
+            // SKIP for value-type instance methods: on .NET 8+, the delegate's
+            // Invoke method may dispatch through the MethodTable slot rather
+            // than _methodPtrAux (the precode). If RestoreAll fails to restore
+            // the slot (observed for CoreLib methods like DateTime.ToString()
+            // when a debugger is attached and tiered compilation is disabled),
+            // DynamicInvoke re-enters the hook → infinite recursion →
+            // AccessViolationException. MethodInfo.Invoke (Path 2) uses
+            // RuntimeMethodHandle.InvokeMethod which bypasses the slot.
+            bool isValueTypeInstance = !methodInfo.IsStatic
+                && methodInfo.DeclaringType != null
+                && methodInfo.DeclaringType.IsValueType;
+            if (_originalDelegate != null && !isValueTypeInstance)
             {
                 RestoreAll();
                 try
@@ -173,8 +201,14 @@ namespace DynamicHook
                 }
             }
 
-            // Path 2: RestoreAll + MethodInfo.Invoke + ReapplyAll.
-            // Must run on the same thread — see Path 0 comment for details.
+            // Path 2: RestoreAll + invoke + ReapplyAll.
+            // For value-type instance methods, prefer the delegate's DynamicInvoke
+            // over MethodInfo.Invoke. On .NET 8 with tiered compilation disabled
+            // (e.g., debugger attached), MethodInfo.Invoke uses
+            // RuntimeMethodHandle.InvokeMethod which may crash with AV for
+            // CoreLib value-type methods. The delegate's Invoke method is
+            // JIT-compiled with knowledge of the value type and correctly
+            // handles byref unboxing.
             RestoreAll();
             try
             {
@@ -182,11 +216,24 @@ namespace DynamicHook
                 {
                     return methodInfo.Invoke(null, args);
                 }
+                // Build args for delegate DynamicInvoke (instance first)
+                if (_originalDelegate != null)
+                {
+                    object[] dlgArgs = new object[(args?.Length ?? 0) + 1];
+                    dlgArgs[0] = instance;
+                    if (args != null) Array.Copy(args, 0, dlgArgs, 1, args.Length);
+                    return _originalDelegate.DynamicInvoke(dlgArgs);
+                }
                 return methodInfo.Invoke(instance, args);
             }
             finally
             {
                 ReapplyAll();
+            }
+            } // end outer try (_inCallOriginal)
+            finally
+            {
+                _inCallOriginal = false;
             }
         }
 
@@ -196,9 +243,21 @@ namespace DynamicHook
         /// can be any type: reference returns use delegate*&lt;..., object&gt;,
         /// value-type returns use delegate*&lt;..., IntPtr&gt; (reading RAX) or
         /// delegate*&lt;..., double&gt; (reading XMM0 for float/double).
+        ///
+        /// Value-type instance methods are also excluded: the delegate* paths pass
+        /// the instance as a boxed object reference in RCX, but the original method
+        /// expects a managed pointer (byref) in RCX. MethodInfo.Invoke (Path 2)
+        /// correctly handles value-type instances by unboxing and passing byref.
         /// </summary>
         private static bool CanUseTrampoline(MethodInfo methodInfo)
         {
+            // Value-type instance methods: delegate* passes boxed object ref,
+            // but original expects byref — fall back to MethodInfo.Invoke.
+            if (!methodInfo.IsStatic && methodInfo.DeclaringType != null
+                && methodInfo.DeclaringType.IsValueType)
+            {
+                return false;
+            }
             foreach (ParameterInfo p in methodInfo.GetParameters())
             {
                 if (!IsReferenceCompatible(p.ParameterType))

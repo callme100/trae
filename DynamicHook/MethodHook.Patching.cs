@@ -84,8 +84,28 @@ namespace DynamicHook
                 diag.SlotCount = _slotAddresses.Count;
                 diag.SlotAddresses = (from a in _slotAddresses.Take(10)
                                       select a.ToInt64()).ToList();
+                // Save each slot's current value BEFORE patching. SlotPatcher.FindSlots
+                // matches cells holding EITHER the precode address OR ResolveRealEntry
+                // (the boxed→unboxed thunk for value-type instance methods), so different
+                // slots can have different originals. Restoring all to a single shared
+                // value corrupts the thunk-pointing slot and creates a circular dispatch
+                // loop between the two precodes (hang on post-uninstall call).
+                _originalSlotValues = new List<IntPtr>(_slotAddresses.Count);
                 foreach (IntPtr slotAddress in _slotAddresses)
                 {
+                    IntPtr originalValue;
+                    try
+                    {
+                        originalValue = MemOps.ReadIntPtr(slotAddress);
+                    }
+                    catch
+                    {
+                        // If we cannot read the current value, fall back to the
+                        // shared precode address — preserves previous behavior for
+                        // this slot and avoids breaking the install entirely.
+                        originalValue = targetPtr;
+                    }
+                    _originalSlotValues.Add(originalValue);
                     SlotPatcher.ReplaceSlot(slotAddress, jumpTarget);
                 }
             }
@@ -310,6 +330,8 @@ namespace DynamicHook
             else if (b == 0xE8 || b == 0xE9)
             {
                 diag.PatchTarget = "Precode";
+                // Dump MethodDesc and fixup-target bytes for diagnostics
+                try { diag.MethodDescDump = MemOps.ReadBytesSafe(_targetMethod.MethodHandle.Value, 64); } catch { }
                 // E8/E9 precode: the precode jumps to either the fixup thunk
                 // (generic methods on .NET Framework 4.x) or directly to JIT code
                 // (non-generic methods, or after backpatching on .NET 6+).
@@ -605,9 +627,39 @@ namespace DynamicHook
                         {
                             int rel32 = *(int*)(p + 1);
                             long fixupAddr = targetPtr.ToInt64() + 5 + rel32;
+                            // Dump fixup code bytes for diagnostics
+                            try { diag.Target1Bytes = MemOps.ReadBytesSafe(new IntPtr(fixupAddr), 32); } catch { }
                             IntPtr fixupJit = TryResolveFixupToJitCode(new IntPtr(fixupAddr));
                             if (fixupJit != IntPtr.Zero) intPtr = fixupJit;
+                            // For non-generic methods, the fixup code is a CLR helper
+                            // without the dictionary setup pattern. Try ResolveRealEntry
+                            // on the fixup code address — it scans for 48 B8 <addr> FF E0
+                            // (MOV RAX, addr; JMP RAX) within the first 24 bytes.
+                            if (intPtr == targetPtr)
+                            {
+                                IntPtr resolved = MethodEntryResolver.ResolveRealEntry(new IntPtr(fixupAddr));
+                                if (resolved != IntPtr.Zero && resolved != new IntPtr(fixupAddr) && LooksLikeRealJitCode(resolved))
+                                {
+                                    intPtr = resolved;
+                                    diag.PatchError += "; E8 fixup resolved=0x" + resolved.ToInt64().ToString("X");
+                                }
+                            }
                         }
+                    }
+                }
+                // Fallback for .NET Framework 4.x E8 precode: scan the MethodDesc
+                // for a JIT code address. After the method is JIT-compiled (by
+                // PrepareMethod or a prior call), the MethodDesc's native code slot
+                // holds the JIT code address. The exact offset varies by MethodDesc
+                // type, so scan all 8-byte aligned values in the first 64 bytes.
+                if (intPtr == targetPtr)
+                {
+                    IntPtr mdJit = ScanMethodDescForJitCode(_targetMethod.MethodHandle.Value, targetPtr);
+                    if (mdJit != IntPtr.Zero)
+                    {
+                        intPtr = mdJit;
+                        _targetJitCode = intPtr;
+                        diag.PatchError += "; MethodDesc JIT=0x" + mdJit.ToInt64().ToString("X");
                     }
                 }
                 if (intPtr == IntPtr.Zero || intPtr == targetPtr)
@@ -641,6 +693,42 @@ namespace DynamicHook
             catch (Exception ex)
             {
                 diag.PatchError = diag.PatchError + "; SecondaryJitPatch error: " + ex.Message;
+            }
+        }
+
+        /// <summary>
+        /// Scans the MethodDesc for a JIT code address. On .NET Framework 4.x,
+        /// after the method is JIT-compiled (by PrepareMethod or a prior call),
+        /// the MethodDesc's native code slot holds the JIT code address. The exact
+        /// offset varies by MethodDesc type (typical offsets: 8, 16, 24, 32), so
+        /// we scan all 8-byte aligned values in the first 64 bytes and return the
+        /// first one that looks like real JIT code (validated by LooksLikeRealJitCode).
+        /// The precode address is excluded to avoid false positives.
+        /// </summary>
+        private unsafe IntPtr ScanMethodDescForJitCode(IntPtr methodDesc, IntPtr precodeAddr)
+        {
+            if (methodDesc == IntPtr.Zero) return IntPtr.Zero;
+            if (!Memory.IsReadable(methodDesc, 64)) return IntPtr.Zero;
+            try
+            {
+                byte* p = (byte*)methodDesc;
+                for (int i = 0; i <= 56; i += 8)
+                {
+                    long val = *(long*)(p + i);
+                    if (val == 0) continue;
+                    // Skip the precode address itself
+                    if (val == precodeAddr.ToInt64()) continue;
+                    IntPtr addr = new IntPtr(val);
+                    if (LooksLikeRealJitCode(addr))
+                    {
+                        return addr;
+                    }
+                }
+                return IntPtr.Zero;
+            }
+            catch
+            {
+                return IntPtr.Zero;
             }
         }
 
@@ -801,6 +889,86 @@ namespace DynamicHook
         {
             return Platform.Current == Platform.Arch.X64
                 && _needsGenericAdapter;
+        }
+
+        /// <summary>
+        /// Determines whether a value-type adapter trampoline is needed.
+        ///
+        /// On x64, instance methods on value types (structs) receive 'this' as a
+        /// managed pointer (byref) in RCX — i.e., RCX = &amp;T. However, a static
+        /// hook method with signature Hook(T self) expects the value by-value in
+        /// RCX. Without an adapter, the hook receives the pointer value interpreted
+        /// as struct data — producing garbage.
+        ///
+        /// The adapter dereferences the pointer: MOV RCX, [RCX], converting
+        /// byref → byval. Only supported for structs ≤ 8 bytes (single register).
+        /// </summary>
+        private bool NeedsValueTypeAdapter()
+        {
+            if (Platform.Current != Platform.Arch.X64)
+                return false;
+            if (_targetMethod.IsStatic || _targetMethod.IsGenericMethod)
+                return false;
+            Type declaringType = _targetMethod.DeclaringType;
+            if (declaringType == null || !declaringType.IsValueType)
+                return false;
+            // The hook method's first parameter must be the value type by-value
+            // (not by-ref). If the user declared it as ref T, no adapter is needed.
+            ParameterInfo[] hookParams = _hookMethod.GetParameters();
+            if (hookParams.Length == 0)
+                return false;
+            Type firstParamType = hookParams[0].ParameterType;
+            if (firstParamType.IsByRef)
+                return false; // user used ref T — byref passes directly, no adapter
+            if (firstParamType != declaringType)
+                return false; // first param doesn't match declaring type
+            // Only support structs that fit in 8 bytes (one register).
+            // Use GetManagedSize instead of Marshal.SizeOf because DateTime and
+            // other structs with LayoutKind.Auto cause Marshal.SizeOf to throw.
+            return GetManagedSize(declaringType) <= 8;
+        }
+
+        /// <summary>
+        /// Computes the managed size of a value type by summing its instance field
+        /// sizes. Unlike Marshal.SizeOf, this works for structs with LayoutKind.Auto
+        /// (e.g., DateTime) which cause Marshal.SizeOf to throw on some runtimes.
+        /// Does not account for explicit layout padding; sufficient for the ≤ 8
+        /// byte check in NeedsValueTypeAdapter.
+        /// </summary>
+        private static int GetManagedSize(Type type)
+        {
+            if (!type.IsValueType) return IntPtr.Size;
+            if (type == typeof(byte) || type == typeof(sbyte)) return 1;
+            if (type == typeof(short) || type == typeof(ushort) || type == typeof(char)) return 2;
+            if (type == typeof(int) || type == typeof(uint) || type == typeof(float)) return 4;
+            if (type == typeof(long) || type == typeof(ulong) || type == typeof(double)) return 8;
+            if (type == typeof(bool)) return 1;
+            if (type == typeof(IntPtr) || type == typeof(UIntPtr)) return IntPtr.Size;
+            if (type.IsEnum) return GetManagedSize(Enum.GetUnderlyingType(type));
+            // Sum instance field sizes for nested structs
+            int size = 0;
+            FieldInfo[] fields = type.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            foreach (FieldInfo f in fields)
+            {
+                size += GetManagedSize(f.FieldType);
+            }
+            return size;
+        }
+
+        /// <summary>
+        /// Builds x64 adapter code that dereferences the 'this' pointer for
+        /// value-type instance methods, converting byref → byval.
+        ///
+        /// Before: RCX = &amp;T (managed pointer to struct data)
+        /// After:  RCX = T  (struct value loaded from [RCX])
+        ///
+        /// Only touches RCX; all other argument registers (RDX, R8, R9) are
+        /// preserved, so methods with additional parameters work correctly.
+        /// </summary>
+        private static byte[] BuildValueTypeAdapterBytes()
+        {
+            // 48 8B 09 = MOV RCX, [RCX]  (REX.W + MOV r64, [r/m64])
+            return new byte[] { 0x48, 0x8B, 0x09 };
         }
 
         /// <summary>

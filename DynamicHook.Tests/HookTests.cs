@@ -38,6 +38,10 @@ namespace DynamicHook.Tests
         // verify that value-type parameters are correctly forwarded.
         public static long LastD1Ticks;
         public static long LastD2Ticks;
+        // Captured DateTime instance ticks from the last hook invocation,
+        // used to verify that the 'this' pointer is correctly forwarded for
+        // value-type instance methods (byref → byval adapter).
+        public static long LastSelfTicks;
 
         // ---------------------------------------------------------------------
         // 1. DateTime.Compare(DateTime, DateTime)  — static, value-type params
@@ -78,6 +82,20 @@ namespace DynamicHook.Tests
             return result;
         }
 
+        // ---------------------------------------------------------------------
+        // 4. DateTime.ToString()  — value-type instance method, no params
+        //    Tests the byref→byval adapter trampoline for struct instance methods.
+        // ---------------------------------------------------------------------
+        public static string Hook_DateTimeToString(DateTime self)
+        {
+            HookEntryCount++;
+            LastSelfTicks = self.Ticks;
+            string result = (string)ActiveHook.CallOriginal(self);
+            CallOriginalCount++;
+            LastCallOriginalResult = result;
+            return result;
+        }
+
         // =====================================================================
         //  Test driver helpers
         // =====================================================================
@@ -89,6 +107,7 @@ namespace DynamicHook.Tests
             LastInliningRisk = false;
             LastD1Ticks = 0;
             LastD2Ticks = 0;
+            LastSelfTicks = 0;
         }
 
         /// <summary>
@@ -112,7 +131,8 @@ namespace DynamicHook.Tests
                                  + " precodeBytes=[{4}] installedBytes=[{5}]"
                                  + " slotErr={6} patchErr={7} delegate={8}"
                                  + " inliningRisk={9}"
-                                 + " hookPrecode=0x{10:X16} hookPrecodeBytes=[{11}] hookResolved=0x{12:X16}",
+                                 + " hookPrecode=0x{10:X16} hookPrecodeBytes=[{11}] hookResolved=0x{12:X16}"
+                                 + " jumpTarget=0x{13:X16} adapterAddr=0x{14:X16}",
                 d.PatchTarget ?? "unknown",
                 d.PatchType ?? "none",
                 d.SlotCount,
@@ -125,7 +145,9 @@ namespace DynamicHook.Tests
                 d.InliningRisk ? "TRUE" : "false",
                 d.HookPrecodeAddr.ToInt64(),
                 hookPrecodeBytes,
-                d.HookResolvedEntry.ToInt64());
+                d.HookResolvedEntry.ToInt64(),
+                d.JumpTargetAddr.ToInt64(),
+                d.AdapterAddr.ToInt64());
         }
 
         // =====================================================================
@@ -900,6 +922,113 @@ namespace DynamicHook.Tests
 
             r.MarkPass("Generic tiered stress: pre-warm(500) + call(1) + stress(500) all triggered hook"
                        + DiagSummary(null));
+            return r;
+        }
+
+        // =====================================================================
+        //  Test 10: DateTime.ToString() — value-type instance method
+        //  Verifies the byref→byval adapter trampoline correctly dereferences
+        //  the 'this' pointer so the static hook receives the actual DateTime
+        //  value, not the pointer to it.
+        // =====================================================================
+        public static TestResult Test_DateTimeToString()
+        {
+            var r = new TestResult { Name = "DateTime.ToString()" };
+
+            MethodInfo target = typeof(DateTime).GetMethod(
+                "ToString",
+                BindingFlags.Public | BindingFlags.Instance,
+                null,
+                Type.EmptyTypes,
+                null);
+            MethodInfo hook = typeof(HookTests).GetMethod(
+                "Hook_DateTimeToString",
+                BindingFlags.Public | BindingFlags.Static);
+
+            if (target == null || hook == null)
+            {
+                r.MarkFail("Could not resolve target/hook MethodInfo");
+                return r;
+            }
+
+            DateTime dt = new DateTime(2025, 7, 10, 12, 30, 45);
+            long expectedTicks = dt.Ticks;
+
+            // Baseline (warm-up).
+            string baseline = dt.ToString();
+
+            using (var hk = new MethodHook(target, hook))
+            {
+                ActiveHook = hk;
+                ResetCounters();
+                try
+                {
+                    hk.Install();
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Install threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                string hooked;
+                try
+                {
+                    hooked = dt.ToString();
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Hooked call threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                if (HookEntryCount == 0)
+                {
+                    r.MarkFail("Hook was NOT triggered (entry count = 0)" + DiagSummary(hk));
+                    return r;
+                }
+                // Verify the DateTime instance was correctly forwarded (byref→byval).
+                if (LastSelfTicks != expectedTicks)
+                {
+                    r.MarkFail("DateTime instance WRONG: received ticks=" + LastSelfTicks
+                               + " expected=" + expectedTicks + DiagSummary(hk));
+                    return r;
+                }
+                if (CallOriginalCount == 0)
+                {
+                    r.MarkFail("CallOriginal was NOT invoked");
+                    return r;
+                }
+                if (hooked != baseline)
+                {
+                    r.MarkFail("Hooked result '" + hooked + "' != baseline '" + baseline + "'");
+                    return r;
+                }
+            }
+
+            // After Uninstall: a direct call must NOT hang or crash — this is the
+            // scenario that previously hung because RestoreAll wrote a single shared
+            // value into both slots, creating a circular dispatch loop between the
+            // two precodes (boxed→unboxed thunk + first precode).
+            string after;
+            try
+            {
+                after = dt.ToString();
+            }
+            catch (Exception ex)
+            {
+                r.MarkFail("Post-uninstall dt.ToString() threw: " + ex.GetType().Name + ": " + ex.Message);
+                return r;
+            }
+            if (after != baseline)
+            {
+                r.MarkFail("After uninstall result mismatch");
+                return r;
+            }
+
+            r.MarkPass("hook triggered=" + HookEntryCount
+                       + ", CallOriginal=" + CallOriginalCount
+                       + ", selfTicks=" + LastSelfTicks);
             return r;
         }
     }
