@@ -20,6 +20,31 @@ namespace DynamicHook
 
         public static bool Is64Bit => Current == Arch.X64 || Current == Arch.ARM64;
 
+        private static readonly Lazy<bool> _isWindows = new Lazy<bool>(() =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+        private static readonly Lazy<bool> _isLinux = new Lazy<bool>(() =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Linux));
+        private static readonly Lazy<bool> _isMacOS = new Lazy<bool>(() =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.OSX));
+
+        /// <summary>True on Windows. Used to branch precode/fixup-thunk patterns
+        /// and calling-convention logic that differs between Windows x64 and
+        /// Unix (System V AMD64) x64.</summary>
+        public static bool IsWindows => _isWindows.Value;
+
+        /// <summary>True on Linux. Used to select the CoreCLR Unix x64 precode
+        /// format (MOV RDX, RSI; MOV RSI, dict) and System V register shifts.</summary>
+        public static bool IsLinux => _isLinux.Value;
+
+        /// <summary>True on macOS. Same CoreCLR Unix x64 precode format as Linux,
+        /// but mmap MAP_ANONYMOUS uses a different numeric value (0x1000).</summary>
+        public static bool IsMacOS => _isMacOS.Value;
+
+        /// <summary>True on any non-Windows OS (Linux, macOS, etc.).
+        /// CoreCLR uses the same Unix x64 managed calling convention on all
+        /// of these platforms.</summary>
+        public static bool IsUnix => _isLinux.Value || _isMacOS.Value;
+
         public static int PatchSize => Current switch
         {
             Arch.X64 => 12,

@@ -173,14 +173,20 @@ namespace DynamicHook.Tests
         }
 
         /// <summary>
-        /// Quotes an argument for the native shell on the current OS. Windows uses
-        /// double quotes; Unix shells use single quotes to avoid expansion.
+        /// Quotes an argument for the process argument string. When
+        /// <see cref="ProcessStartInfo.UseShellExecute"/> is false, .NET's own
+        /// argument parser handles the splitting — it respects double quotes for
+        /// grouping on BOTH Windows and Unix, but does NOT handle single quotes
+        /// on Unix (they become literal characters). So we always use double
+        /// quotes.
         /// </summary>
         private static string QuoteArg(string arg)
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return "\"" + arg.Replace("\"", "\"\"") + "\"";
-            return "'" + arg.Replace("'", "'\\''") + "'";
+            // Unix with UseShellExecute=false: .NET parses Arguments using
+            // double-quote grouping. Backslash-escape embedded double quotes.
+            return "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
         /// <summary>

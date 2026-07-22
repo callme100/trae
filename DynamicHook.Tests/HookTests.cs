@@ -132,7 +132,8 @@ namespace DynamicHook.Tests
                                  + " slotErr={6} patchErr={7} delegate={8}"
                                  + " inliningRisk={9}"
                                  + " hookPrecode=0x{10:X16} hookPrecodeBytes=[{11}] hookResolved=0x{12:X16}"
-                                 + " jumpTarget=0x{13:X16} adapterAddr=0x{14:X16}",
+                                 + " jumpTarget=0x{13:X16} adapterAddr=0x{14:X16}"
+                                 + " callOrig={15}",
                 d.PatchTarget ?? "unknown",
                 d.PatchType ?? "none",
                 d.SlotCount,
@@ -147,7 +148,8 @@ namespace DynamicHook.Tests
                 hookPrecodeBytes,
                 d.HookResolvedEntry.ToInt64(),
                 d.JumpTargetAddr.ToInt64(),
-                d.AdapterAddr.ToInt64());
+                d.AdapterAddr.ToInt64(),
+                d.CallOrigStatus ?? "-");
         }
 
         // =====================================================================

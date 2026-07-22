@@ -1,0 +1,10 @@
+[trace] DT baseline start useDelegate=False
+[trace] DT baseline done = -1
+[trace] DT Install start
+[trace] DT Install done
+[trace] DT hooked call start
+[dthook] ENTER CallOriginal method=Compare isStatic=True _targetJitCode=0x00007FDE037B9090 _needsGenericAdapter=False _originalDelegate=set _delegateInvokeFptr=0x00007FDE044DBCC0 CanUseTrampoline=False CanUseJitDirectValueArgs=False
+[dthook] PATH 1a check _targetJitCode!=0 useRefPath=False useValuePath=False (will take=False)
+[dthook] PATH 1 _originalDelegate!=null && !isValueTypeInstance (isValueTypeInstance=False)
+[dthook] PATH 1 DynamicInvoke (static)
+[dthook] REENTRANCY THROW _targetJitCode=0x00007FDE037B9090 _secondaryJitAddr=0x00007FDE037B9090 _hasSecondaryPatch=True

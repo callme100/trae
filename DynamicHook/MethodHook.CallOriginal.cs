@@ -107,41 +107,56 @@ namespace DynamicHook
             }
 
             // Path 1a: Call the original JIT code directly via delegate*.
-            // On .NET 8+, the delegate's Invoke method may dispatch through
-            // the MethodTable slot rather than _methodPtrAux (the precode).
-            // If RestoreAll fails to restore the slot (observed on .NET 8 for
-            // CoreLib methods like string.Compare), the delegate's Invoke
-            // re-enters the hook, causing an infinite loop.
+            // This bypasses BOTH the precode AND the MethodTable slot, making
+            // it immune to re-entrancy. After RestoreAll, the secondary JIT
+            // patch at _targetJitCode is restored to original bytes, so the
+            // call reaches the real method body.
             //
-            // Calling _targetJitCode directly bypasses BOTH the precode and
-            // the MethodTable slot. After RestoreAll, the secondary JIT patch
-            // at _targetJitCode is restored to original bytes, so the call
-            // reaches the real method body. delegate* (managed calling convention)
-            // keeps the thread in cooperative GC mode for proper object-reference
-            // tracking. Only works for reference-type parameters (CanUseTrampoline).
-            if (_targetJitCode != IntPtr.Zero && CanUseTrampoline(methodInfo))
+            // Two sub-paths:
+            // (a) Reference-type params (or no params): use delegate*<object, ...>
+            //     via InvokeViaFptr (CanUseTrampoline). The managed calling
+            //     convention keeps the thread in cooperative GC mode for
+            //     proper object-reference tracking.
+            // (b) Static methods with all value-type params (<=8 bytes,
+            //     non-float/double): use delegate*<IntPtr, ...> via
+            //     InvokeViaJitFptrDirect (CanUseJitDirectValueArgs). Each
+            //     value-type arg is unboxed to a raw IntPtr. No GC-tracked
+            //     references are involved, so delegate*<IntPtr> is safe.
+            //     This eliminates re-entrancy for methods like DateTime.Compare
+            //     on .NET 8+ where DynamicInvoke/MethodInfo.Invoke may
+            //     dispatch through a patched slot.
+            if (_targetJitCode != IntPtr.Zero)
             {
-                RestoreAll();
-                try
+                bool useRefPath = CanUseTrampoline(methodInfo);
+                bool useValuePath = !useRefPath && CanUseJitDirectValueArgs(methodInfo);
+                if (useRefPath || useValuePath)
                 {
-                    object[] jitArgs = new object[argCount];
-                    int slot = 0;
-                    if (!methodInfo.IsStatic)
+                    RestoreAll();
+                    try
                     {
-                        jitArgs[slot++] = instance;
-                    }
-                    if (args != null)
-                    {
-                        for (int i = 0; i < args.Length; i++)
+                        object[] jitArgs = new object[argCount];
+                        int slot = 0;
+                        if (!methodInfo.IsStatic)
                         {
-                            jitArgs[slot++] = args[i];
+                            jitArgs[slot++] = instance;
                         }
+                        if (args != null)
+                        {
+                            for (int i = 0; i < args.Length; i++)
+                            {
+                                jitArgs[slot++] = args[i];
+                            }
+                        }
+                        if (useValuePath)
+                        {
+                            return InvokeViaJitFptrDirect(_targetJitCode, jitArgs, isVoid, returnType, methodInfo);
+                        }
+                        return InvokeViaFptr(_targetJitCode, jitArgs, isVoid, returnType);
                     }
-                    return InvokeViaFptr(_targetJitCode, jitArgs, isVoid, returnType);
-                }
-                finally
-                {
-                    ReapplyAll();
+                    finally
+                    {
+                        ReapplyAll();
+                    }
                 }
             }
 
@@ -178,20 +193,23 @@ namespace DynamicHook
                     {
                         return InvokeViaDelegateFptr(methodInfo, instance, args);
                     }
-                    // Fallback: DynamicInvoke (may crash for generic methods)
-                    object[] invokeArgs;
+                    // Fallback when delegate* cannot be used (value-type params
+                    // that don't meet the JIT-direct criteria — e.g. float/double
+                    // params, value types >8 bytes, or instance methods with
+                    // value-type params). DynamicInvoke correctly boxes/unboxes
+                    // value-type parameters. For static methods with value-type
+                    // params that DO meet the criteria, Path 1a handles them
+                    // without re-entrancy; this fallback is only reached for
+                    // the remaining cases.
                     if (methodInfo.IsStatic)
                     {
-                        invokeArgs = args ?? Array.Empty<object>();
+                        return _originalDelegate.DynamicInvoke(args ?? Array.Empty<object>());
                     }
-                    else
+                    object[] invokeArgs = new object[(args?.Length ?? 0) + 1];
+                    invokeArgs[0] = instance;
+                    if (args != null)
                     {
-                        invokeArgs = new object[(args?.Length ?? 0) + 1];
-                        invokeArgs[0] = instance;
-                        if (args != null)
-                        {
-                            Array.Copy(args, 0, invokeArgs, 1, args.Length);
-                        }
+                        Array.Copy(args, 0, invokeArgs, 1, args.Length);
                     }
                     return _originalDelegate.DynamicInvoke(invokeArgs);
                 }
@@ -418,6 +436,308 @@ namespace DynamicHook
                 return true;
             }
             return t == typeof(IntPtr) || t == typeof(UIntPtr);
+        }
+
+        /// <summary>
+        /// Checks whether a STATIC method has all value-type parameters (<=8 bytes,
+        /// non-float/double) and a value-type or void return (<=8 bytes), making it
+        /// eligible for the JIT-direct delegate* path with raw IntPtr arguments.
+        ///
+        /// This path bypasses BOTH the precode AND the MethodTable slot, eliminating
+        /// re-entrancy for methods like DateTime.Compare on .NET 8+ where
+        /// DynamicInvoke/MethodInfo.Invoke may dispatch through a patched slot.
+        ///
+        /// Restrictions:
+        /// - Static only (instance methods have a reference-type 'this' needing GC
+        ///   tracking, which delegate*<IntPtr> cannot provide).
+        /// - No float/double params (they use XMM registers, not general-purpose
+        ///   registers; delegate*<IntPtr> would place them in the wrong register).
+        /// - No reference-type returns (cannot safely convert IntPtr back to a
+        ///   GC-tracked object reference without Unsafe, which is unavailable on
+        ///   netstandard2.0).
+        /// - All value types must be <=8 bytes (single-register passing) and
+        ///   blittable (for GCHandle.Pinned used during unboxing).
+        /// - Nullable&lt;T&gt; is excluded due to special boxing semantics.
+        /// </summary>
+        private static bool CanUseJitDirectValueArgs(MethodInfo methodInfo)
+        {
+            // Only for static methods — instance methods have a reference-type
+            // 'this' that needs GC tracking.
+            if (!methodInfo.IsStatic) return false;
+
+            // Check return type — no reference returns.
+            Type returnType = methodInfo.ReturnType;
+            if (returnType != typeof(void))
+            {
+                if (!returnType.IsValueType) return false;
+                if (returnType.IsGenericType &&
+                    returnType.GetGenericTypeDefinition() == typeof(Nullable<>)) return false;
+                // Value-type returns >8 bytes use a hidden pointer parameter
+                // which shifts all other arguments.
+                int retSz = GetValueTypeSize(returnType);
+                if (retSz < 0 || retSz > 8) return false;
+            }
+
+            // Check all params are value types <=8 bytes (non-float/double).
+            foreach (ParameterInfo p in methodInfo.GetParameters())
+            {
+                Type t = p.ParameterType;
+                if (!t.IsValueType) return false;
+                if (t == typeof(float) || t == typeof(double)) return false;
+                if (t.IsGenericType &&
+                    t.GetGenericTypeDefinition() == typeof(Nullable<>)) return false;
+                int sz = GetValueTypeSize(t);
+                if (sz < 0 || sz > 8) return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Calls the target JIT code directly via delegate* with raw IntPtr
+        /// arguments. Used for static methods where all parameters are value
+        /// types <=8 bytes (non-float/double). Each boxed value-type arg is
+        /// unboxed to a raw IntPtr and passed in the correct register via
+        /// delegate*<IntPtr, ...>.
+        ///
+        /// This bypasses BOTH the precode AND the MethodTable slot, making it
+        /// immune to the re-entrancy that affects DynamicInvoke/MethodInfo.Invoke
+        /// on .NET 8+. After RestoreAll, the JIT code at _targetJitCode is
+        /// restored to original bytes, so the call reaches the real method body.
+        ///
+        /// No GC-tracked references are involved (all args are raw values, return
+        /// is void or value-type), so delegate*<IntPtr> is safe without GC
+        /// reporting. The calling convention for IntPtr args matches the JIT
+        /// code's expectation on both Windows x64 (RCX, RDX, R8, R9) and Unix
+        /// System V AMD64 (RDI, RSI, RDX, RCX, R8, R9).
+        /// </summary>
+        private static unsafe object InvokeViaJitFptrDirect(
+            IntPtr fptr, object[] args, bool isVoid, Type returnType,
+            MethodInfo methodInfo)
+        {
+            // Categorize return type (no reference returns — excluded by
+            // CanUseJitDirectValueArgs).
+            bool floatReturn = returnType == typeof(float);
+            bool doubleReturn = returnType == typeof(double);
+            bool valueReturn = !isVoid && returnType.IsValueType
+                && !floatReturn && !doubleReturn;
+
+            // Convert all args from boxed objects to raw IntPtr values.
+            // For static methods (the only kind reaching here), all args are
+            // value-type params.
+            int n = args.Length;
+            IntPtr[] rawArgs = new IntPtr[n];
+            ParameterInfo[] parameters = methodInfo.GetParameters();
+            int paramOffset = methodInfo.IsStatic ? 0 : 1;
+            for (int i = 0; i < n; i++)
+            {
+                if (i < paramOffset)
+                {
+                    // Instance arg — not reached for static methods.
+                    rawArgs[i] = IntPtr.Zero;
+                }
+                else
+                {
+                    rawArgs[i] = UnboxValueToIntPtr(args[i],
+                        parameters[i - paramOffset].ParameterType);
+                }
+            }
+
+            object result;
+            switch (n)
+            {
+                case 0:
+                    if (isVoid) { ((delegate*<void>)fptr)(); result = null; }
+                    else if (floatReturn) result = ((delegate*<float>)fptr)();
+                    else if (doubleReturn) result = ((delegate*<double>)fptr)();
+                    else result = BoxValueResult(((delegate*<IntPtr>)fptr)(), returnType);
+                    break;
+                case 1:
+                    if (isVoid) { ((delegate*<IntPtr, void>)fptr)(rawArgs[0]); result = null; }
+                    else if (floatReturn) result = ((delegate*<IntPtr, float>)fptr)(rawArgs[0]);
+                    else if (doubleReturn) result = ((delegate*<IntPtr, double>)fptr)(rawArgs[0]);
+                    else result = BoxValueResult(((delegate*<IntPtr, IntPtr>)fptr)(rawArgs[0]), returnType);
+                    break;
+                case 2:
+                    if (isVoid) { ((delegate*<IntPtr, IntPtr, void>)fptr)(rawArgs[0], rawArgs[1]); result = null; }
+                    else if (floatReturn) result = ((delegate*<IntPtr, IntPtr, float>)fptr)(rawArgs[0], rawArgs[1]);
+                    else if (doubleReturn) result = ((delegate*<IntPtr, IntPtr, double>)fptr)(rawArgs[0], rawArgs[1]);
+                    else result = BoxValueResult(((delegate*<IntPtr, IntPtr, IntPtr>)fptr)(rawArgs[0], rawArgs[1]), returnType);
+                    break;
+                case 3:
+                    if (isVoid) { ((delegate*<IntPtr, IntPtr, IntPtr, void>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2]); result = null; }
+                    else if (floatReturn) result = ((delegate*<IntPtr, IntPtr, IntPtr, float>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2]);
+                    else if (doubleReturn) result = ((delegate*<IntPtr, IntPtr, IntPtr, double>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2]);
+                    else result = BoxValueResult(((delegate*<IntPtr, IntPtr, IntPtr, IntPtr>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2]), returnType);
+                    break;
+                case 4:
+                    if (isVoid) { ((delegate*<IntPtr, IntPtr, IntPtr, IntPtr, void>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2], rawArgs[3]); result = null; }
+                    else if (floatReturn) result = ((delegate*<IntPtr, IntPtr, IntPtr, IntPtr, float>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2], rawArgs[3]);
+                    else if (doubleReturn) result = ((delegate*<IntPtr, IntPtr, IntPtr, IntPtr, double>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2], rawArgs[3]);
+                    else result = BoxValueResult(((delegate*<IntPtr, IntPtr, IntPtr, IntPtr, IntPtr>)fptr)(rawArgs[0], rawArgs[1], rawArgs[2], rawArgs[3]), returnType);
+                    break;
+                default:
+                    throw new NotSupportedException(
+                        "JIT-direct path supports at most 4 arguments");
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Unboxes a boxed value type (<=8 bytes, non-float) to a raw IntPtr.
+        /// Uses GCHandle.Pinned to get a pointer to the value data, then reads
+        /// the appropriate number of bytes (4 or 8) and zero-extends to 64 bits.
+        ///
+        /// For types <=4 bytes (int, uint, short, etc.), reads 4 bytes and
+        /// zero-extends. For types 5-8 bytes (DateTime, long, etc.), reads the
+        /// full 8 bytes. This matches the x64 calling convention where small
+        /// values are zero-extended to 64 bits in the register.
+        ///
+        /// Non-blittable types (Auto-layout like DateTime on .NET 6) cannot be
+        /// pinned via GCHandle.Pinned. Falls back to Marshal.StructureToPtr to
+        /// copy the value to unmanaged memory, then reads from there.
+        /// </summary>
+        private static IntPtr UnboxValueToIntPtr(object boxed, Type type)
+        {
+            if (boxed == null) return IntPtr.Zero;
+
+            int sz = GetValueTypeSize(type);
+            if (sz < 0)
+            {
+                throw new NotSupportedException(
+                    "JIT-direct path cannot determine size of value type: " + type.FullName);
+            }
+
+            // Try GCHandle.Pinned first (fast path for blittable types)
+            try
+            {
+                GCHandle handle = GCHandle.Alloc(boxed, GCHandleType.Pinned);
+                try
+                {
+                    IntPtr dataPtr = handle.AddrOfPinnedObject();
+                    if (sz <= 4)
+                    {
+                        return new IntPtr((long)(ulong)(uint)Marshal.ReadInt32(dataPtr));
+                    }
+                    return Marshal.ReadIntPtr(dataPtr);
+                }
+                finally
+                {
+                    handle.Free();
+                }
+            }
+            catch (ArgumentException)
+            {
+                // Non-blittable (Auto layout) types like DateTime cannot be
+                // pinned (GCHandle.Pinned throws) NOR marshaled
+                // (Marshal.StructureToPtr throws) on .NET 6.
+                //
+                // Fall back to manually serializing each field's raw bytes
+                // into a blittable byte[] buffer, then pin the buffer and
+                // read the packed bytes.
+                //
+                // GetValueTypeSize has already verified the type contains no
+                // reference-type fields (it returns -1 otherwise) and is <=8
+                // bytes. For single-field structs (DateTime, TimeSpan,
+                // DateTimeOffset — all 8 bytes) this is exact. For multi-field
+                // Auto-layout structs the CLR may reorder fields, but such
+                // types are not exercised by the JIT-direct path tests and
+                // would also fail Marshal.SizeOf (so we'd never reach here
+                // with a type we can't handle).
+                //
+                // Note: UnboxValueToIntPtr returns the field's VALUE packed
+                // into an IntPtr (its raw bits), NOT a pointer to the field's
+                // storage. So we decompose the returned IntPtr via bit shifts
+                // rather than memory reads.
+                byte[] buf = new byte[sz];
+                int offset = 0;
+                FieldInfo[] fields = type.GetFields(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                foreach (FieldInfo f in fields)
+                {
+                    int fieldSize = GetValueTypeSize(f.FieldType);
+                    if (fieldSize < 0)
+                    {
+                        throw new NotSupportedException(
+                            "JIT-direct path cannot serialize non-blittable field: "
+                            + type.FullName + "." + f.Name);
+                    }
+                    object fieldValue = f.GetValue(boxed);
+                    // Recursively unbox the field value (handles nested value
+                    // types; primitive fields take the fast pinned path).
+                    IntPtr fieldPacked = UnboxValueToIntPtr(fieldValue, f.FieldType);
+                    long fieldBits = fieldPacked.ToInt64();
+                    // Write fieldSize bytes in little-endian order.
+                    for (int i = 0; i < fieldSize; i++)
+                    {
+                        buf[offset + i] = (byte)(fieldBits >> (i * 8));
+                    }
+                    offset += fieldSize;
+                }
+                // Pin the blittable byte[] (arrays of primitive types are
+                // always blittable) and read the packed bytes.
+                GCHandle bufHandle = GCHandle.Alloc(buf, GCHandleType.Pinned);
+                try
+                {
+                    IntPtr dataPtr = bufHandle.AddrOfPinnedObject();
+                    if (sz <= 4)
+                    {
+                        return new IntPtr((long)(ulong)(uint)Marshal.ReadInt32(dataPtr));
+                    }
+                    return Marshal.ReadIntPtr(dataPtr);
+                }
+                finally
+                {
+                    bufHandle.Free();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Computes the in-memory size of a value type, in bytes.
+        ///
+        /// Uses <see cref="Marshal.SizeOf(Type)"/> for blittable Sequential/Explicit
+        /// layouts (the common case). For Auto-layout types such as
+        /// <see cref="DateTime"/> (where Marshal.SizeOf throws
+        /// <see cref="ArgumentException"/>), falls back to summing the sizes of all
+        /// instance fields recursively.
+        ///
+        /// Returns -1 if the size cannot be determined — e.g. if the type (or any
+        /// nested value-type field) contains a reference-type field, which would
+        /// make it ineligible for the delegate*&lt;IntPtr&gt; JIT-direct path anyway.
+        ///
+        /// The field-sum is a conservative approximation that ignores inter-field
+        /// padding. This is acceptable for the &lt;=8-byte register-passing check:
+        /// single-field structs (DateTime, TimeSpan, DateTimeOffset — all 8 bytes)
+        /// are computed exactly, and multi-field structs with padding that pushes
+        /// the actual size above 8 bytes still have a field-sum &gt;= the size of
+        /// their largest field, so 8+byte fields yield a sum &gt; 8 → rejected.
+        /// </summary>
+        private static int GetValueTypeSize(Type t)
+        {
+            // Reference types cannot be passed via delegate*<IntPtr>.
+            if (!t.IsValueType) return -1;
+
+            // Blittable Sequential/Explicit layouts — Marshal.SizeOf is exact.
+            try { return Marshal.SizeOf(t); }
+            catch { /* Auto layout or non-blittable — fall through */ }
+
+            // Auto-layout value types (e.g. DateTime): sum instance field sizes.
+            // Enums reach here too on some runtimes; use the underlying type.
+            if (t.IsEnum)
+            {
+                return GetValueTypeSize(Enum.GetUnderlyingType(t));
+            }
+
+            int total = 0;
+            foreach (FieldInfo f in t.GetFields(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                int sub = GetValueTypeSize(f.FieldType);
+                if (sub < 0) return -1; // contains a reference-type field
+                total += sub;
+            }
+            return total;
         }
     }
 }

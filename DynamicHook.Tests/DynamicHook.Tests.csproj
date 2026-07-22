@@ -2,7 +2,10 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>net472;net6.0;net8.0;net10.0</TargetFrameworks>
+    <!-- net472 is Windows-only; include it only when building on Windows so
+         Linux/macOS can still build/test the cross-platform TFMs. -->
+    <TargetFrameworks Condition="'$(OS)' == 'Windows_NT'">net472;net6.0;net8.0;net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="'$(OS)' != 'Windows_NT'">net6.0;net8.0;net10.0</TargetFrameworks>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
