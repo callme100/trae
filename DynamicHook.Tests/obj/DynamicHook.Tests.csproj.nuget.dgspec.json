@@ -1,28 +1,35 @@
 {
   "format": 1,
   "restore": {
-    "/workspace/DynamicHook.Tests/DynamicHook.Tests.csproj": {}
+    "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj": {}
   },
   "projects": {
-    "/workspace/DynamicHook.Tests/DynamicHook.Tests.csproj": {
+    "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "/workspace/DynamicHook.Tests/DynamicHook.Tests.csproj",
+        "projectUniqueName": "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
         "projectName": "DynamicHook.Tests",
-        "projectPath": "/workspace/DynamicHook.Tests/DynamicHook.Tests.csproj",
-        "packagesPath": "/root/.nuget/packages/",
-        "outputPath": "/workspace/DynamicHook.Tests/obj/",
+        "projectPath": "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
+        "packagesPath": "C:\\Users\\test\\.nuget\\packages\\",
+        "outputPath": "C:\\trae\\DynamicHook.Tests\\obj\\",
         "projectStyle": "PackageReference",
         "crossTargeting": true,
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
         "configFilePaths": [
-          "/root/.nuget/NuGet/NuGet.Config"
+          "C:\\Users\\test\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
         ],
         "originalTargetFrameworks": [
           "net10.0",
+          "net472",
           "net6.0",
           "net8.0"
         ],
         "sources": {
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
           "https://api.nuget.org/v3/index.json": {}
         },
         "frameworks": {
@@ -30,8 +37,17 @@
             "framework": "net10.0",
             "targetAlias": "net10.0",
             "projectReferences": {
-              "/workspace/DynamicHook/DynamicHook.csproj": {
-                "projectPath": "/workspace/DynamicHook/DynamicHook.csproj"
+              "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+                "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
+              }
+            }
+          },
+          "net472": {
+            "framework": "net472",
+            "targetAlias": "net472",
+            "projectReferences": {
+              "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+                "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
               }
             }
           },
@@ -39,8 +55,8 @@
             "framework": "net6.0",
             "targetAlias": "net6.0",
             "projectReferences": {
-              "/workspace/DynamicHook/DynamicHook.csproj": {
-                "projectPath": "/workspace/DynamicHook/DynamicHook.csproj"
+              "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+                "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
               }
             }
           },
@@ -48,8 +64,8 @@
             "framework": "net8.0",
             "targetAlias": "net8.0",
             "projectReferences": {
-              "/workspace/DynamicHook/DynamicHook.csproj": {
-                "projectPath": "/workspace/DynamicHook/DynamicHook.csproj"
+              "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
+                "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj"
               }
             }
           }
@@ -86,7 +102,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "/root/.dotnet/sdk/10.0.302/PortableRuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301/PortableRuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.CSharp": "(,4.7.32767]",
             "Microsoft.VisualBasic": "(,10.4.32767]",
@@ -362,6 +378,11 @@
             "System.Xml.XPath.XDocument": "(,5.0.32767]"
           }
         },
+        "net472": {
+          "framework": "net472",
+          "targetAlias": "net472",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301\\RuntimeIdentifierGraph.json"
+        },
         "net6.0": {
           "framework": "net6.0",
           "targetAlias": "net6.0",
@@ -376,26 +397,12 @@
           ],
           "assetTargetFallback": true,
           "warn": true,
-          "downloadDependencies": [
-            {
-              "name": "Microsoft.AspNetCore.App.Ref",
-              "version": "[6.0.36, 6.0.36]"
-            },
-            {
-              "name": "Microsoft.NETCore.App.Host.linux-x64",
-              "version": "[6.0.36, 6.0.36]"
-            },
-            {
-              "name": "Microsoft.NETCore.App.Ref",
-              "version": "[6.0.36, 6.0.36]"
-            }
-          ],
           "frameworkReferences": {
             "Microsoft.NETCore.App": {
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "/root/.dotnet/sdk/10.0.302/RuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301\\RuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.CSharp": "(,4.7.32767]",
             "Microsoft.VisualBasic": "(,10.3.32767]",
@@ -698,7 +705,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "/root/.dotnet/sdk/10.0.302/PortableRuntimeIdentifierGraph.json",
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301/PortableRuntimeIdentifierGraph.json",
           "packagesToPrune": {
             "Microsoft.CSharp": "(,4.7.32767]",
             "Microsoft.VisualBasic": "(,10.3.32767]",
@@ -982,24 +989,35 @@
             "System.Xml.XPath.XDocument": "(,4.3.32767]"
           }
         }
+      },
+      "runtimes": {
+        "win-x86": {
+          "#import": []
+        }
       }
     },
-    "/workspace/DynamicHook/DynamicHook.csproj": {
+    "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "/workspace/DynamicHook/DynamicHook.csproj",
+        "projectUniqueName": "C:\\trae\\DynamicHook\\DynamicHook.csproj",
         "projectName": "DynamicHook",
-        "projectPath": "/workspace/DynamicHook/DynamicHook.csproj",
-        "packagesPath": "/root/.nuget/packages/",
-        "outputPath": "/workspace/DynamicHook/obj/",
+        "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj",
+        "packagesPath": "C:\\Users\\test\\.nuget\\packages\\",
+        "outputPath": "C:\\trae\\DynamicHook\\obj\\",
         "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
         "configFilePaths": [
-          "/root/.nuget/NuGet/NuGet.Config"
+          "C:\\Users\\test\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
         ],
         "originalTargetFrameworks": [
           "netstandard2.0"
         ],
         "sources": {
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
           "https://api.nuget.org/v3/index.json": {}
         },
         "frameworks": {
@@ -1044,7 +1062,7 @@
           ],
           "assetTargetFallback": true,
           "warn": true,
-          "runtimeIdentifierGraphPath": "/root/.dotnet/sdk/10.0.302/RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301\\RuntimeIdentifierGraph.json"
         }
       }
     }

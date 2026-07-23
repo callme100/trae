@@ -48,6 +48,14 @@ namespace DynamicHook
             _inCallOriginal = true;
             try
             {
+            DiagTrace("ENTER CallOriginal method=" + methodInfo.Name
+                      + " isStatic=" + methodInfo.IsStatic
+                      + " _targetJitCode=0x" + _targetJitCode.ToInt64().ToString("X16")
+                      + " _needsGenericAdapter=" + _needsGenericAdapter
+                      + " _originalDelegate=" + (_originalDelegate != null ? "set" : "null")
+                      + " _delegateInvokeFptr=0x" + _delegateInvokeFptr.ToInt64().ToString("X16")
+                      + " CanUseTrampoline=" + CanUseTrampoline(methodInfo)
+                      + " CanUseJitDirectValueArgs=" + CanUseJitDirectValueArgs(methodInfo));
             // Path 0: for generic methods, use RestoreAll + invoke + ReapplyAll.
             // Prefer the delegate's Invoke method (via delegate*) over MethodInfo.Invoke,
             // because RuntimeMethodHandle.InvokeMethod (used by MethodInfo.Invoke) does not
@@ -125,10 +133,31 @@ namespace DynamicHook
             //     This eliminates re-entrancy for methods like DateTime.Compare
             //     on .NET 8+ where DynamicInvoke/MethodInfo.Invoke may
             //     dispatch through a patched slot.
+            // Non-primitive value-type returns (DateTime, TimeSpan, etc.) cannot
+            // go through either delegate*<object,...,IntPtr> path:
+            //  - Path 1a(a) calls delegate*<object,...,IntPtr> at raw JIT code and
+            //    reinterprets RAX bits — unreliable for non-primitive value types.
+            //  - Path 1 InvokeViaDelegateFptr uses the same delegate*<object,...,IntPtr>
+            //    signature on the delegate's Invoke method, which throws
+            //    ArgumentException "signature not compatible" for non-primitive
+            //    value-type returns.
+            // Both paths must fall through to DynamicInvoke (Path 1 fallback),
+            // which correctly boxes/unboxes value-type returns.
+            bool nonPrimitiveValueReturn = !isVoid && returnType.IsValueType
+                && returnType != typeof(float) && returnType != typeof(double)
+                && !returnType.IsEnum && !returnType.IsPrimitive;
+
             if (_targetJitCode != IntPtr.Zero)
             {
                 bool useRefPath = CanUseTrampoline(methodInfo);
                 bool useValuePath = !useRefPath && CanUseJitDirectValueArgs(methodInfo);
+                if (nonPrimitiveValueReturn && useRefPath && argCount > 0)
+                {
+                    useRefPath = false;
+                }
+                DiagTrace("PATH 1a check _targetJitCode!=0 useRefPath=" + useRefPath
+                          + " useValuePath=" + useValuePath
+                          + " (will take=" + (useRefPath || useValuePath) + ")");
                 if (useRefPath || useValuePath)
                 {
                     RestoreAll();
@@ -149,8 +178,10 @@ namespace DynamicHook
                         }
                         if (useValuePath)
                         {
+                            DiagTrace("PATH 1a(b) InvokeViaJitFptrDirect jitCode=0x" + _targetJitCode.ToInt64().ToString("X16"));
                             return InvokeViaJitFptrDirect(_targetJitCode, jitArgs, isVoid, returnType, methodInfo);
                         }
+                        DiagTrace("PATH 1a(a) InvokeViaFptr jitCode=0x" + _targetJitCode.ToInt64().ToString("X16"));
                         return InvokeViaFptr(_targetJitCode, jitArgs, isVoid, returnType);
                     }
                     finally
@@ -158,6 +189,10 @@ namespace DynamicHook
                         ReapplyAll();
                     }
                 }
+            }
+            else
+            {
+                DiagTrace("PATH 1a SKIPPED: _targetJitCode == IntPtr.Zero");
             }
 
             // Path 1: cached delegate's Invoke via function pointer.
@@ -181,6 +216,7 @@ namespace DynamicHook
                 && methodInfo.DeclaringType.IsValueType;
             if (_originalDelegate != null && !isValueTypeInstance)
             {
+                DiagTrace("PATH 1 _originalDelegate!=null && !isValueTypeInstance (isValueTypeInstance=" + isValueTypeInstance + ")");
                 RestoreAll();
                 try
                 {
@@ -189,8 +225,10 @@ namespace DynamicHook
                     // parameters, fall back to DynamicInvoke (which correctly
                     // boxes/unboxes). Value-type RETURNS are handled by
                     // InvokeViaFptr via delegate*<..., IntPtr>.
-                    if (_delegateInvokeFptr != IntPtr.Zero && CanUseTrampoline(methodInfo))
+                    if (_delegateInvokeFptr != IntPtr.Zero && CanUseTrampoline(methodInfo)
+                        && !nonPrimitiveValueReturn)
                     {
+                        DiagTrace("PATH 1 InvokeViaDelegateFptr");
                         return InvokeViaDelegateFptr(methodInfo, instance, args);
                     }
                     // Fallback when delegate* cannot be used (value-type params
@@ -203,6 +241,7 @@ namespace DynamicHook
                     // the remaining cases.
                     if (methodInfo.IsStatic)
                     {
+                        DiagTrace("PATH 1 DynamicInvoke (static)");
                         return _originalDelegate.DynamicInvoke(args ?? Array.Empty<object>());
                     }
                     object[] invokeArgs = new object[(args?.Length ?? 0) + 1];
@@ -211,6 +250,7 @@ namespace DynamicHook
                     {
                         Array.Copy(args, 0, invokeArgs, 1, args.Length);
                     }
+                    DiagTrace("PATH 1 DynamicInvoke (instance)");
                     return _originalDelegate.DynamicInvoke(invokeArgs);
                 }
                 finally
@@ -219,6 +259,8 @@ namespace DynamicHook
                 }
             }
 
+            DiagTrace("PATH 2 RestoreAll+Invoke (isValueTypeInstance=" + isValueTypeInstance
+                      + " _originalDelegate=" + (_originalDelegate != null ? "set" : "null") + ")");
             // Path 2: RestoreAll + invoke + ReapplyAll.
             // For value-type instance methods, prefer the delegate's DynamicInvoke
             // over MethodInfo.Invoke. On .NET 8 with tiered compilation disabled
@@ -307,12 +349,14 @@ namespace DynamicHook
 
             // Value types > 8 bytes use a hidden pointer parameter (RCX on x64),
             // which shifts all other arguments and breaks the delegate* ABI.
+            // Use GetValueTypeSize instead of Marshal.SizeOf: Auto-layout value
+            // types (e.g. DateTime, which is 8 bytes but [StructLayout(Auto)])
+            // cause Marshal.SizeOf to throw ArgumentException, which previously
+            // fell back to sz=16 and incorrectly rejected DateTime as > 8 bytes.
             if (valueReturn)
             {
-                int sz;
-                try { sz = Marshal.SizeOf(returnType); }
-                catch { sz = 16; }
-                if (sz > 8)
+                int sz = GetValueTypeSize(returnType);
+                if (sz < 0 || sz > 8)
                 {
                     throw new NotSupportedException(
                         "delegate* path does not support value-type returns > 8 bytes: " + returnType);
@@ -385,7 +429,58 @@ namespace DynamicHook
             if (returnType == typeof(IntPtr)) return rawResult;
             if (returnType == typeof(UIntPtr)) return (UIntPtr)val;
             if (returnType.IsEnum) return Enum.ToObject(returnType, val);
+            // Non-primitive value types <= 8 bytes (DateTime, TimeSpan, etc.):
+            // reinterpret the raw bits in RAX as the target type. These types
+            // (often [StructLayout(Auto)]) cannot use Convert.ChangeType and
+            // are not blittable for pinned-handle tricks. The generic helper
+            // below is JIT-specialized per type and performs a raw reinterpret.
+            if (returnType.IsValueType)
+            {
+                return ReinterpretValueBits(rawResult, returnType);
+            }
             return Convert.ChangeType(val, returnType);
+        }
+
+        /// <summary>
+        /// Reinterprets the raw 64-bit return value (RAX) as an arbitrary
+        /// unmanaged value type &le; 8 bytes and boxes it. Used for non-primitive
+        /// value types such as <see cref="DateTime"/> and <see cref="TimeSpan"/>
+        /// whose raw bits are returned in RAX but which are not blittable and
+        /// cannot be reconstructed via <see cref="Convert.ChangeType"/>.
+        ///
+        /// The generic specialization is invoked through a cached reflection
+        /// delegate (one per type) so the reinterpret is a single unsafe pointer
+        /// dereference with no per-call reflection cost.
+        /// </summary>
+        private static unsafe TReturn ReinterpretBits<TReturn>(long bits) where TReturn : unmanaged
+        {
+            // Copy to a local so we can take its address. Value types <= 8 bytes
+            // with no reference fields (validated by the unmanaged constraint and
+            // the caller's GetValueTypeSize <= 8 check) can be reinterpreted safely.
+            long local = bits;
+            return *(TReturn*)&local;
+        }
+
+        // Cache of compiled ReinterpretBits<T> invokers, keyed by return type.
+        private static readonly System.Collections.Generic.Dictionary<Type, Func<long, object>> _reinterpretCache =
+            new System.Collections.Generic.Dictionary<Type, Func<long, object>>();
+
+        private static object ReinterpretValueBits(IntPtr rawResult, Type returnType)
+        {
+            Func<long, object> invoker;
+            lock (_reinterpretCache)
+            {
+                if (!_reinterpretCache.TryGetValue(returnType, out invoker))
+                {
+                    MethodInfo mi = typeof(MethodHook).GetMethod(
+                        "ReinterpretBits",
+                        BindingFlags.NonPublic | BindingFlags.Static)
+                        .MakeGenericMethod(returnType);
+                    invoker = (Func<long, object>)mi.CreateDelegate(typeof(Func<long, object>));
+                    _reinterpretCache[returnType] = invoker;
+                }
+            }
+            return invoker(rawResult.ToInt64());
         }
 
         /// <summary>
@@ -593,9 +688,12 @@ namespace DynamicHook
         /// full 8 bytes. This matches the x64 calling convention where small
         /// values are zero-extended to 64 bits in the register.
         ///
-        /// Non-blittable types (Auto-layout like DateTime on .NET 6) cannot be
-        /// pinned via GCHandle.Pinned. Falls back to Marshal.StructureToPtr to
-        /// copy the value to unmanaged memory, then reads from there.
+        /// Non-blittable value types (Auto layout, e.g. <see cref="DateTime"/>)
+        /// cannot be pinned via GCHandle.Pinned — GCHandle.Alloc throws
+        /// ArgumentException. For these, fall back to a DynamicMethod that
+        /// unboxes the value and reinterprets its raw bits as a long via cpblk.
+        /// This is safe because CanUseJitDirectValueArgs already enforces
+        /// size <=8 bytes (single-register passing).
         /// </summary>
         private static IntPtr UnboxValueToIntPtr(object boxed, Type type)
         {
@@ -608,89 +706,91 @@ namespace DynamicHook
                     "JIT-direct path cannot determine size of value type: " + type.FullName);
             }
 
-            // Try GCHandle.Pinned first (fast path for blittable types)
+            GCHandle handle;
+            bool pinned = false;
             try
             {
-                GCHandle handle = GCHandle.Alloc(boxed, GCHandleType.Pinned);
-                try
-                {
-                    IntPtr dataPtr = handle.AddrOfPinnedObject();
-                    if (sz <= 4)
-                    {
-                        return new IntPtr((long)(ulong)(uint)Marshal.ReadInt32(dataPtr));
-                    }
-                    return Marshal.ReadIntPtr(dataPtr);
-                }
-                finally
-                {
-                    handle.Free();
-                }
+                handle = GCHandle.Alloc(boxed, GCHandleType.Pinned);
+                pinned = true;
             }
             catch (ArgumentException)
             {
-                // Non-blittable (Auto layout) types like DateTime cannot be
-                // pinned (GCHandle.Pinned throws) NOR marshaled
-                // (Marshal.StructureToPtr throws) on .NET 6.
-                //
-                // Fall back to manually serializing each field's raw bytes
-                // into a blittable byte[] buffer, then pin the buffer and
-                // read the packed bytes.
-                //
-                // GetValueTypeSize has already verified the type contains no
-                // reference-type fields (it returns -1 otherwise) and is <=8
-                // bytes. For single-field structs (DateTime, TimeSpan,
-                // DateTimeOffset — all 8 bytes) this is exact. For multi-field
-                // Auto-layout structs the CLR may reorder fields, but such
-                // types are not exercised by the JIT-direct path tests and
-                // would also fail Marshal.SizeOf (so we'd never reach here
-                // with a type we can't handle).
-                //
-                // Note: UnboxValueToIntPtr returns the field's VALUE packed
-                // into an IntPtr (its raw bits), NOT a pointer to the field's
-                // storage. So we decompose the returned IntPtr via bit shifts
-                // rather than memory reads.
-                byte[] buf = new byte[sz];
-                int offset = 0;
-                FieldInfo[] fields = type.GetFields(
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                foreach (FieldInfo f in fields)
+                // Non-blittable value type (Auto layout, e.g. DateTime).
+                // Fall back to DynamicMethod-based bit reinterpretation.
+                long bits = UnboxNonBlittableToLong(boxed, type);
+                if (sz <= 4)
                 {
-                    int fieldSize = GetValueTypeSize(f.FieldType);
-                    if (fieldSize < 0)
-                    {
-                        throw new NotSupportedException(
-                            "JIT-direct path cannot serialize non-blittable field: "
-                            + type.FullName + "." + f.Name);
-                    }
-                    object fieldValue = f.GetValue(boxed);
-                    // Recursively unbox the field value (handles nested value
-                    // types; primitive fields take the fast pinned path).
-                    IntPtr fieldPacked = UnboxValueToIntPtr(fieldValue, f.FieldType);
-                    long fieldBits = fieldPacked.ToInt64();
-                    // Write fieldSize bytes in little-endian order.
-                    for (int i = 0; i < fieldSize; i++)
-                    {
-                        buf[offset + i] = (byte)(fieldBits >> (i * 8));
-                    }
-                    offset += fieldSize;
+                    return new IntPtr((long)(ulong)(uint)bits);
                 }
-                // Pin the blittable byte[] (arrays of primitive types are
-                // always blittable) and read the packed bytes.
-                GCHandle bufHandle = GCHandle.Alloc(buf, GCHandleType.Pinned);
-                try
+                return new IntPtr(bits);
+            }
+
+            try
+            {
+                IntPtr dataPtr = handle.AddrOfPinnedObject();
+                if (sz <= 4)
                 {
-                    IntPtr dataPtr = bufHandle.AddrOfPinnedObject();
-                    if (sz <= 4)
-                    {
-                        return new IntPtr((long)(ulong)(uint)Marshal.ReadInt32(dataPtr));
-                    }
-                    return Marshal.ReadIntPtr(dataPtr);
+                    // Zero-extend 4-byte value to 64 bits (int, uint, short, etc.)
+                    return new IntPtr((long)(ulong)(uint)Marshal.ReadInt32(dataPtr));
                 }
-                finally
+                // Read 8 bytes (DateTime, long, etc.)
+                return Marshal.ReadIntPtr(dataPtr);
+            }
+            finally
+            {
+                if (pinned) handle.Free();
+            }
+        }
+
+        /// <summary>
+        /// Cached unboxers for non-blittable value types. Each entry maps a
+        /// Type to a <see cref="MethodInfo"/> for the generic helper
+        /// <see cref="ValueToBits{T}"/>; invoking it unboxes the value and
+        /// reinterprets its raw bits as a long. Safe for value types <=8 bytes
+        /// (enforced by CanUseJitDirectValueArgs).
+        /// </summary>
+        private static readonly System.Collections.Generic.Dictionary<Type, MethodInfo>
+            _unboxToLongCache = new System.Collections.Generic.Dictionary<Type, MethodInfo>();
+
+        /// <summary>
+        /// Reinterprets the raw bits of an unmanaged value type as a long.
+        /// Used to unbox non-blittable value types (e.g. DateTime, which is
+        /// Auto-layout and cannot be pinned via GCHandle) into a raw IntPtr
+        /// for the JIT-direct delegate* path.
+        /// </summary>
+        private static unsafe long ValueToBits<T>(T value) where T : unmanaged
+        {
+            T local = value;
+            // CanUseJitDirectValueArgs enforces <=8 bytes; for <=4 bytes,
+            // zero-extend to match x64 calling convention.
+            if (sizeof(T) <= 4)
+            {
+                return (long)(ulong)(uint)(*(int*)&local);
+            }
+            return *(long*)&local;
+        }
+
+        private static long UnboxNonBlittableToLong(object boxed, Type type)
+        {
+            MethodInfo mi;
+            lock (_unboxToLongCache)
+            {
+                if (!_unboxToLongCache.TryGetValue(type, out mi))
                 {
-                    bufHandle.Free();
+                    // MakeGenericMethod throws ArgumentException if the type
+                    // does not satisfy the `unmanaged` constraint (i.e. it
+                    // contains reference-type fields). CanUseJitDirectValueArgs
+                    // already filtered such types via GetValueTypeSize, but
+                    // guard against it just in case.
+                    MethodInfo template = typeof(MethodHook).GetMethod(
+                        "ValueToBits",
+                        BindingFlags.NonPublic | BindingFlags.Static);
+                    mi = template.MakeGenericMethod(type);
+                    _unboxToLongCache[type] = mi;
                 }
             }
+            // Invoke unboxes the object argument to T automatically.
+            return (long)mi.Invoke(null, new object[] { boxed });
         }
 
         /// <summary>

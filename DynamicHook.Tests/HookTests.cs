@@ -96,6 +96,40 @@ namespace DynamicHook.Tests
             return result;
         }
 
+        // ---------------------------------------------------------------------
+        // 5. DateTime.ParseExact(string, string, IFormatProvider)
+        //    — static, reference-type params, returns DateTime (value type,
+        //    Auto-layout, 8 bytes). Exercises the delegate*<..., IntPtr> return
+        //    path with ReinterpretBits<DateTime> (raw RAX bits → boxed DateTime).
+        // ---------------------------------------------------------------------
+        public static DateTime Hook_DateTimeParseExact(string s, string format, IFormatProvider provider)
+        {
+            HookEntryCount++;
+            // Static method: pass null as instance, then all parameters.
+            DateTime result = (DateTime)ActiveHook.CallOriginal(null, s, format, provider);
+            CallOriginalCount++;
+            LastCallOriginalResult = result;
+            LastSelfTicks = result.Ticks;
+            return result;
+        }
+
+        // ---------------------------------------------------------------------
+        // 6. DateTime.op_GreaterThan(DateTime, DateTime)
+        //    — static, two non-blittable (Auto-layout) value-type params,
+        //    returns bool. Exercises the JIT-direct delegate*<IntPtr> path with
+        //    non-blittable parameter unboxing via DynamicMethod cpblk.
+        // ---------------------------------------------------------------------
+        public static bool Hook_DateTimeGreaterThan(DateTime d1, DateTime d2)
+        {
+            LastD1Ticks = d1.Ticks;
+            LastD2Ticks = d2.Ticks;
+            HookEntryCount++;
+            bool result = (bool)ActiveHook.CallOriginal(null, d1, d2);
+            CallOriginalCount++;
+            LastCallOriginalResult = result;
+            return result;
+        }
+
         // =====================================================================
         //  Test driver helpers
         // =====================================================================
@@ -132,8 +166,7 @@ namespace DynamicHook.Tests
                                  + " slotErr={6} patchErr={7} delegate={8}"
                                  + " inliningRisk={9}"
                                  + " hookPrecode=0x{10:X16} hookPrecodeBytes=[{11}] hookResolved=0x{12:X16}"
-                                 + " jumpTarget=0x{13:X16} adapterAddr=0x{14:X16}"
-                                 + " callOrig={15}",
+                                 + " jumpTarget=0x{13:X16} adapterAddr=0x{14:X16}",
                 d.PatchTarget ?? "unknown",
                 d.PatchType ?? "none",
                 d.SlotCount,
@@ -148,8 +181,7 @@ namespace DynamicHook.Tests
                 hookPrecodeBytes,
                 d.HookResolvedEntry.ToInt64(),
                 d.JumpTargetAddr.ToInt64(),
-                d.AdapterAddr.ToInt64(),
-                d.CallOrigStatus ?? "-");
+                d.AdapterAddr.ToInt64());
         }
 
         // =====================================================================
@@ -231,7 +263,14 @@ namespace DynamicHook.Tests
                 }
                 catch (Exception ex)
                 {
-                    return "FAIL Hooked call threw: " + ex.GetType().Name + ": " + ex.Message;
+                    string inner = ex.InnerException != null
+                        ? " INNER[" + ex.InnerException.GetType().Name + ": " + ex.InnerException.Message + "]"
+                        : "";
+                    string istack = ex.InnerException != null && ex.InnerException.StackTrace != null
+                        ? " ISTACK[" + (ex.InnerException.StackTrace.Split('\n')[0].Trim()) + "]"
+                        : "";
+                    return "FAIL Hooked call threw: " + ex.GetType().Name + ": " + ex.Message
+                           + inner + istack + DiagSummary(hk);
                 }
 
                 if (HookEntryCount == 0)
@@ -1031,6 +1070,215 @@ namespace DynamicHook.Tests
             r.MarkPass("hook triggered=" + HookEntryCount
                        + ", CallOriginal=" + CallOriginalCount
                        + ", selfTicks=" + LastSelfTicks);
+            return r;
+        }
+
+        // =====================================================================
+        //  Test 5: DateTime.ParseExact(string, string, IFormatProvider)
+        //          — static, returns DateTime (value type, Auto-layout, 8 bytes)
+        // =====================================================================
+        public static TestResult Test_DateTimeParseExact()
+        {
+            var r = new TestResult { Name = "DateTime.ParseExact(string,string,IFormatProvider)" };
+
+            MethodInfo target = typeof(DateTime).GetMethod(
+                "ParseExact",
+                BindingFlags.Public | BindingFlags.Static,
+                null,
+                new[] { typeof(string), typeof(string), typeof(IFormatProvider) },
+                null);
+            MethodInfo hook = typeof(HookTests).GetMethod(
+                "Hook_DateTimeParseExact",
+                BindingFlags.Public | BindingFlags.Static);
+
+            if (target == null || hook == null)
+            {
+                r.MarkFail("Could not resolve target/hook MethodInfo");
+                return r;
+            }
+
+            string input = "2025-07-22 14:30:00";
+            string format = "yyyy-MM-dd HH:mm:ss";
+            // Baseline (warm-up).
+            DateTime baseline = DateTime.ParseExact(input, format, System.Globalization.CultureInfo.InvariantCulture);
+            r.Expected = baseline.ToString("O");
+
+            using (var hk = new MethodHook(target, hook))
+            {
+                ActiveHook = hk;
+                ResetCounters();
+                try
+                {
+                    hk.Install();
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Install threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                DateTime hooked;
+                try
+                {
+                    hooked = DateTime.ParseExact(input, format, System.Globalization.CultureInfo.InvariantCulture);
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Hooked call threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                if (HookEntryCount == 0)
+                {
+                    r.MarkFail("Hook was NOT triggered (entry count = 0)" + DiagSummary(hk));
+                    return r;
+                }
+                if (CallOriginalCount == 0)
+                {
+                    r.MarkFail("CallOriginal was NOT invoked");
+                    return r;
+                }
+                // Verify the DateTime value-type return was correctly reinterpreted
+                // from raw RAX bits (the bug being fixed: previously threw
+                // NotSupportedException for value-type returns > 8 bytes because
+                // Marshal.SizeOf threw on Auto-layout DateTime).
+                if (hooked != baseline)
+                {
+                    r.MarkFail("Hooked result " + hooked.ToString("O")
+                               + " != baseline " + baseline.ToString("O"));
+                    return r;
+                }
+            }
+
+            // After Uninstall.
+            DateTime after;
+            try
+            {
+                after = DateTime.ParseExact(input, format, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch (Exception ex)
+            {
+                r.MarkFail("Post-uninstall ParseExact threw: " + ex.GetType().Name + ": " + ex.Message);
+                return r;
+            }
+            if (after != baseline)
+            {
+                r.MarkFail("After uninstall result mismatch");
+                return r;
+            }
+
+            r.MarkPass("hook triggered=" + HookEntryCount
+                       + ", CallOriginal=" + CallOriginalCount
+                       + ", resultTicks=" + LastSelfTicks);
+            return r;
+        }
+
+        // =====================================================================
+        //  Test 6: DateTime.op_GreaterThan(DateTime, DateTime)
+        //          — static, non-blittable value-type params, returns bool
+        // =====================================================================
+        public static TestResult Test_DateTimeGreaterThan()
+        {
+            var r = new TestResult { Name = "DateTime.op_GreaterThan(DateTime,DateTime)" };
+
+            MethodInfo target = typeof(DateTime).GetMethod(
+                "op_GreaterThan",
+                BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly);
+            MethodInfo hook = typeof(HookTests).GetMethod(
+                "Hook_DateTimeGreaterThan",
+                BindingFlags.Public | BindingFlags.Static);
+
+            if (target == null || hook == null)
+            {
+                r.MarkFail("Could not resolve target/hook MethodInfo");
+                return r;
+            }
+
+            DateTime a = new DateTime(2025, 1, 1);
+            DateTime b = new DateTime(2026, 1, 1);
+            // Baseline (warm-up) — also forces JIT compilation.
+            bool baselineGreater = (a > b);   // false
+            bool baselineLess = (b > a);      // true
+            r.Expected = "false,true";
+
+            using (var hk = new MethodHook(target, hook))
+            {
+                ActiveHook = hk;
+                ResetCounters();
+                try
+                {
+                    hk.Install();
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Install threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                bool hookedGreater, hookedLess;
+                try
+                {
+                    // Force the operator through the hook (avoid C# > lowering
+                    // being JIT-inlined by using a delegate indirection).
+                    Func<DateTime, DateTime, bool> cmp = (x, y) => (bool)target.Invoke(null, new object[] { x, y });
+                    hookedGreater = cmp(a, b);
+                    ResetCounters();
+                    hookedLess = cmp(b, a);
+                }
+                catch (Exception ex)
+                {
+                    r.MarkFail("Hooked call threw: " + ex.GetType().Name + ": " + ex.Message);
+                    return r;
+                }
+
+                if (HookEntryCount == 0)
+                {
+                    r.MarkFail("Hook was NOT triggered (entry count = 0)" + DiagSummary(hk));
+                    return r;
+                }
+                if (CallOriginalCount == 0)
+                {
+                    r.MarkFail("CallOriginal was NOT invoked");
+                    return r;
+                }
+                if (hookedGreater != baselineGreater || hookedLess != baselineLess)
+                {
+                    r.MarkFail("Hooked results (" + hookedGreater + "," + hookedLess
+                               + ") != baseline (" + baselineGreater + "," + baselineLess + ")");
+                    return r;
+                }
+                // Verify parameter forwarding through the non-blittable unbox path.
+                if (LastD1Ticks != b.Ticks || LastD2Ticks != a.Ticks)
+                {
+                    r.MarkFail("Parameter forward mismatch: d1.Ticks=" + LastD1Ticks
+                               + " d2.Ticks=" + LastD2Ticks
+                               + " expected d1=" + b.Ticks + " d2=" + a.Ticks);
+                    return r;
+                }
+            }
+
+            // After Uninstall.
+            bool afterGreater, afterLess;
+            try
+            {
+                afterGreater = (a > b);
+                afterLess = (b > a);
+            }
+            catch (Exception ex)
+            {
+                r.MarkFail("Post-uninstall op_GreaterThan threw: " + ex.GetType().Name + ": " + ex.Message);
+                return r;
+            }
+            if (afterGreater != baselineGreater || afterLess != baselineLess)
+            {
+                r.MarkFail("After uninstall result mismatch");
+                return r;
+            }
+
+            r.MarkPass("hook triggered=" + HookEntryCount
+                       + ", CallOriginal=" + CallOriginalCount
+                       + ", results=" + baselineGreater + "," + baselineLess
+                       + ", d1Ticks=" + LastD1Ticks + ", d2Ticks=" + LastD2Ticks);
             return r;
         }
     }

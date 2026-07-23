@@ -125,6 +125,8 @@ namespace DynamicHook.Tests
                 { "ListConvertAll",    HookTests.Test_ListConvertAll },
                 { "ListConvertAllTieredStress", HookTests.Test_ListConvertAllTieredStress },
                 { "DateTimeToString",  HookTests.Test_DateTimeToString },
+                { "DateTimeParseExact", HookTests.Test_DateTimeParseExact },
+                { "DateTimeGreaterThan", HookTests.Test_DateTimeGreaterThan },
             };
 
         /// <summary>

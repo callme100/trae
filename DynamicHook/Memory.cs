@@ -1,7 +1,4 @@
 using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.IO;
 using System.Runtime.InteropServices;
 
 namespace DynamicHook
@@ -11,17 +8,6 @@ namespace DynamicHook
         private static readonly IntPtr CurrentProcess = new IntPtr(-1);
 
         private static int PageSize => 4096;
-
-        // ---- /proc/self/maps cache for Linux readability checks ----
-        // mincore only checks page mapping, not permissions. Pages mapped
-        // with PROT_NONE return as "mapped" from mincore but cause SIGSEGV
-        // on read. On .NET 6, SIGSEGV from managed code (including unsafe
-        // pointer dereferences) terminates the process — it is NOT catchable.
-        // Parsing /proc/self/maps gives us actual permission bits (r/w/x),
-        // which is the only reliable way to check readability on Linux.
-        private static List<(long Start, long End)> _readableRegions;
-        private static int _readableRegionsTicks;
-        private static readonly object _readableRegionsLock = new object();
 
         // Windows page protection constants (VirtualProtect dwNewProtect).
         // VirtualProtect REPLACES the page protection (it is not an OR), so the
@@ -283,189 +269,8 @@ namespace DynamicHook
                 return p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY
                     || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
             }
-            // Unix (Linux/macOS): use mincore to check if the pages are mapped.
-            // Simply returning true causes uncatchable AccessViolationException
-            // (process terminates) when SlotPatcher scans 65536 bytes past the
-            // MethodTable into unmapped pages. This is especially common on
-            // .NET 6 where the MethodTable is followed by unmapped pages.
-            //
-            // mincore(addr, length, vec): addr must be page-aligned; vec must
-            // have at least (length + pagesize - 1) / pagesize bytes. Returns 0
-            // if all pages are mapped and resident; returns -1 with ENOMEM if
-            // any page is not in the process's address space.
-            return IsReadableUnix(addr, size);
-        }
-
-        /// <summary>
-        /// Unix implementation of IsReadable. On Linux, parses /proc/self/maps
-        /// for reliable permission checking. On macOS, falls back to mincore
-        /// (which checks mapping but not permissions — less reliable but better
-        /// than always returning true).
-        /// </summary>
-        private static bool IsReadableUnix(IntPtr addr, int size)
-        {
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            {
-                return IsReadableLinux(addr, size);
-            }
-            // macOS and other Unix: use mincore as a best-effort check.
-            return IsReadableMincore(addr, size);
-        }
-
-        /// <summary>
-        /// Linux: checks readability by parsing /proc/self/maps. This is the
-        /// ONLY reliable way to check readability on Linux, because:
-        /// 1. mincore checks mapping, not permissions (PROT_NONE pages are
-        ///    "mapped" but unreadable)
-        /// 2. On .NET 6, SIGSEGV from managed code terminates the process
-        ///    (uncatchable), so try/catch around reads does NOT work
-        /// The parsed maps are cached for 1 second to avoid repeated file I/O.
-        /// </summary>
-        private static bool IsReadableLinux(IntPtr addr, int size)
-        {
-            List<(long Start, long End)> regions = GetReadableRegions();
-            if (regions == null || regions.Count == 0)
-            {
-                // Failed to parse /proc/self/maps — conservatively return false
-                // to avoid crashing the process on .NET 6.
-                return false;
-            }
-            long addrLong = addr.ToInt64();
-            long endLong = addrLong + size;
-            // Binary search for a region containing the address range.
-            int lo = 0, hi = regions.Count - 1;
-            while (lo <= hi)
-            {
-                int mid = lo + (hi - lo) / 2;
-                if (endLong <= regions[mid].Start)
-                {
-                    hi = mid - 1;
-                }
-                else if (addrLong >= regions[mid].End)
-                {
-                    lo = mid + 1;
-                }
-                else
-                {
-                    // addr is within this region — check the full range fits
-                    return endLong <= regions[mid].End;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>
-        /// Gets the cached list of readable memory regions from /proc/self/maps.
-        /// The cache is refreshed at most once per second to balance accuracy
-        /// and performance.
-        /// </summary>
-        private static List<(long Start, long End)> GetReadableRegions()
-        {
-            int now = Environment.TickCount;
-            // Fast path: cache is fresh (handle int overflow correctly)
-            if (_readableRegions != null && (now - _readableRegionsTicks) < 1000)
-            {
-                return _readableRegions;
-            }
-            lock (_readableRegionsLock)
-            {
-                // Double-check after acquiring lock
-                if (_readableRegions != null && (now - _readableRegionsTicks) < 1000)
-                {
-                    return _readableRegions;
-                }
-                _readableRegions = ParseProcSelfMaps();
-                _readableRegionsTicks = now;
-                return _readableRegions;
-            }
-        }
-
-        /// <summary>
-        /// Invalidates the cached /proc/self/maps readability data. Call this
-        /// after operations that may allocate new memory regions (e.g. tiered
-        /// JIT compilation warmup) so subsequent IsReadable checks see the new
-        /// regions instead of stale cache data.
-        /// </summary>
-        public static void InvalidateReadableCache()
-        {
-            lock (_readableRegionsLock)
-            {
-                _readableRegions = null;
-                _readableRegionsTicks = 0;
-            }
-        }
-
-        /// <summary>
-        /// Parses /proc/self/maps and returns a sorted list of readable regions
-        /// (regions with 'r' permission).
-        /// </summary>
-        private static List<(long Start, long End)> ParseProcSelfMaps()
-        {
-            var regions = new List<(long Start, long End)>();
-            try
-            {
-                string[] lines = File.ReadAllLines("/proc/self/maps");
-                foreach (string line in lines)
-                {
-                    // Format: start-end perms offset dev inode pathname
-                    // Example: 7f8a12340000-7f8a12350000 r--p 00000000 00:00 0
-                    int spaceIdx = line.IndexOf(' ');
-                    if (spaceIdx <= 0) continue;
-                    string rangePart = line.Substring(0, spaceIdx);
-                    int dashIdx = rangePart.IndexOf('-');
-                    if (dashIdx <= 0) continue;
-                    string startStr = rangePart.Substring(0, dashIdx);
-                    string endStr = rangePart.Substring(dashIdx + 1);
-                    if (!long.TryParse(startStr, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long start))
-                        continue;
-                    if (!long.TryParse(endStr, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long end))
-                        continue;
-                    // Check permissions (second field)
-                    int permsStart = spaceIdx + 1;
-                    // Skip whitespace between range and perms
-                    while (permsStart < line.Length && line[permsStart] == ' ')
-                        permsStart++;
-                    if (permsStart >= line.Length) continue;
-                    // First char of perms is 'r' for readable
-                    if (line[permsStart] != 'r') continue;
-                    regions.Add((start, end));
-                }
-            }
-            catch
-            {
-                // /proc/self/maps not available — return empty list (IsReadable
-                // will return false, preventing crashes).
-            }
-            regions.Sort((a, b) => a.Start.CompareTo(b.Start));
-            return regions;
-        }
-
-        /// <summary>
-        /// macOS/other Unix: uses mincore to check page mapping. This is less
-        /// reliable than /proc/self/maps (it checks mapping, not permissions),
-        /// but it's better than always returning true. On macOS, AVs from
-        /// managed code may be catchable (unlike .NET 6 on Linux), so the
-        /// try/catch in callers provides an additional safety net.
-        /// </summary>
-        private static bool IsReadableMincore(IntPtr addr, int size)
-        {
-            long pageSize = PageSize;
-            long addrLong = addr.ToInt64();
-            long pageStart = addrLong & ~(pageSize - 1);
-            long readEnd = addrLong + size;
-            long scanEnd = (readEnd + pageSize - 1) & ~(pageSize - 1);
-            long length = scanEnd - pageStart;
-            int pageCount = (int)((length + pageSize - 1) / pageSize);
-            byte[] vec = new byte[pageCount];
-            try
-            {
-                int ret = mincore(new IntPtr(pageStart), new UIntPtr((ulong)length), vec);
-                return ret == 0;
-            }
-            catch
-            {
-                return false;
-            }
+            // Non-Windows: assume readable (mmap'd pages are readable until munmap'd)
+            return true;
         }
 
         /// <summary>
@@ -574,8 +379,5 @@ namespace DynamicHook
 
         [DllImport("libc", SetLastError = true)]
         private static extern int munmap(IntPtr addr, UIntPtr len);
-
-        [DllImport("libc", SetLastError = true)]
-        private static extern int mincore(IntPtr addr, UIntPtr length, byte[] vec);
     }
 }

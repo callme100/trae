@@ -270,21 +270,6 @@ namespace DynamicHook
             // creates an infinite loop (target JIT code is E9-patched to jump
             // back to the same address). Detect and prevent this.
             IntPtr targetJitCode = MethodEntryResolver.ResolveRealEntry(functionPointer);
-            // If ResolveRealEntry returned an unreadable address (stale precode
-            // chain after tiered promotion), try ScanMethodDescForJitCode as a
-            // fallback. The MethodDesc's native code slot holds the current JIT
-            // code address. This MUST be done BEFORE InstallSlotReplacement,
-            // which patches the MethodDesc slots and makes the JIT code address
-            // unreadable from the MethodDesc.
-            if (targetJitCode == IntPtr.Zero ||
-                (targetJitCode != functionPointer && !Memory.IsReadable(targetJitCode, 16)))
-            {
-                IntPtr mdJit = ScanMethodDescForJitCode(_targetMethod.MethodHandle.Value, functionPointer);
-                if (mdJit != IntPtr.Zero)
-                {
-                    targetJitCode = mdJit;
-                }
-            }
             // Save the target's JIT code address BEFORE slot replacement.
             // InstallSecondaryJitPatch reuses this instead of re-resolving,
             // because ResolveRealEntry called after slot replacement would
@@ -401,35 +386,12 @@ namespace DynamicHook
             if (Environment.Version.Major >= 8)
             {
                 IntPtr postFp = _targetMethod.MethodHandle.GetFunctionPointer();
-                // IMPORTANT: For generic methods, InstallSlotReplacement may have
-                // patched the MethodDesc's entry point field (found during the
-                // MethodTable scan) to point to our hook adapter trampoline
-                // (_newSlotValue). In that case, GetFunctionPointer() returns
-                // _newSlotValue — this is NOT a precode replacement by the CLR,
-                // just our own slot replacement being reflected. Skip the
-                // re-patch logic in this case to avoid false positives.
-                if (postFp != IntPtr.Zero && postFp != functionPointer && postFp != _newSlotValue)
+                if (postFp != IntPtr.Zero && postFp != functionPointer)
                 {
-                    // Precode was replaced during install. Re-apply the key
-                    // patches at the new precode address instead of orphaning.
-                    // We do NOT call Uninstall (which corrupts state). Instead,
-                    // we patch the new precode's indirect data cell and update
-                    // slot replacements to point to the hook.
-                    bool repatched = RepatchAtNewPrecode(postFp, functionPointer, hookDiagInfo);
-                    if (repatched)
-                    {
-                        hookDiagInfo.PatchError += "; Precode replaced during install (0x"
-                            + functionPointer.ToInt64().ToString("X") + " -> 0x"
-                            + postFp.ToInt64().ToString("X")
-                            + "), REPATCHED at new precode.";
-                    }
-                    else
-                    {
-                        hookDiagInfo.PatchError += "; WARNING: Precode replaced during install (0x"
-                            + functionPointer.ToInt64().ToString("X") + " -> 0x"
-                            + postFp.ToInt64().ToString("X")
-                            + "). Repatch failed — patches may be orphaned.";
-                    }
+                    hookDiagInfo.PatchError += "; WARNING: Precode replaced during install (0x"
+                        + functionPointer.ToInt64().ToString("X") + " -> 0x"
+                        + postFp.ToInt64().ToString("X")
+                        + "). Patches may be orphaned. Consider re-installing the hook.";
                 }
                 else if (postFp == functionPointer)
                 {
@@ -675,21 +637,7 @@ namespace DynamicHook
                 // By forcing promotion BEFORE patching, we ensure ResolveRealEntry
                 // returns the stable tier-1 JIT code address, and our patches are
                 // applied to code that will not be promoted again.
-                //
-                // GENERIC methods are included on .NET 8+: on .NET 8+,
-                // tiered promotion can replace the precode and/or the generic
-                // dictionary's code pointer, orphaning patches. Direct call
-                // sites for generic methods are backpatched to call the tier-1
-                // JIT code directly (bypassing the precode). Without warmup,
-                // the fixup thunk's jit_addr points to tier-0 code that gets
-                // deallocated after promotion — our patches are orphaned and
-                // the hook is never triggered. The warmup forces promotion to
-                // complete BEFORE patching, so the fixup thunk's jit_addr points
-                // to stable tier-1 code. If the precode IS replaced during
-                // install, RepatchAtNewPrecode re-applies patches at the new
-                // precode address.
-                bool needsWarmup = Environment.Version.Major >= 8;
-                if (needsWarmup)
+                if (Environment.Version.Major >= 8 && !mi.IsGenericMethod)
                 {
                     for (int i = 0; i < 50; i++)
                     {
@@ -709,11 +657,6 @@ namespace DynamicHook
                     // Wait briefly for the background tier-1 JIT thread to
                     // complete compilation and update the precode's data cell.
                     System.Threading.Thread.Sleep(50);
-                    // Invalidate the /proc/self/maps cache — tiered promotion
-                    // may have allocated new executable memory regions for the
-                    // tier-1 JIT code. Without this, IsReadable may return
-                    // false for the new JIT code address (stale cache).
-                    Memory.InvalidateReadableCache();
                 }
             }
             catch
@@ -859,7 +802,23 @@ namespace DynamicHook
             {
                 return;
             }
+            DiagTraceUninstall("Uninstall START _patchType=" + _patchType
+                + " _patchAddress=0x" + _patchAddress.ToInt64().ToString("X16")
+                + " _secondaryJitAddress=0x" + _secondaryJitAddress.ToInt64().ToString("X16")
+                + " _hasSecondaryPatch=" + _hasSecondaryPatch
+                + " _hasIndirectPatch=" + _hasIndirectPatch
+                + " _indirectTargetLoc=0x" + _indirectTargetLoc.ToInt64().ToString("X16")
+                + " _originalIndirectTarget=0x" + _originalIndirectTarget.ToInt64().ToString("X16")
+                + " _newSlotValue=0x" + _newSlotValue.ToInt64().ToString("X16")
+                + " _targetJitCode=0x" + _targetJitCode.ToInt64().ToString("X16"));
             RestoreAll();
+            DiagTraceUninstall("Uninstall after RestoreAll: precode[0..1]="
+                + ByteHex(MemOps.ReadBytesSafe(_patchAddress, 2))
+                + " jit[0..4]=" + ByteHex(MemOps.ReadBytesSafe(_secondaryJitAddress, 5))
+                + " indirectCell=0x" + ReadIntPtrCellSafe(_indirectTargetLoc).ToInt64().ToString("X16")
+                + " (origIndirect=0x" + _originalIndirectTarget.ToInt64().ToString("X16")
+                + " newSlot=0x" + _newSlotValue.ToInt64().ToString("X16") + ")"
+                + " patchErr=" + (DiagInfo != null ? DiagInfo.PatchError : "-"));
             if (_nearTrampoline != IntPtr.Zero)
             {
                 SafeTry("FreeExec nearTrampoline", () => Memory.FreeExec(_nearTrampoline, 12));
@@ -876,6 +835,31 @@ namespace DynamicHook
                 _hookAdapterTrampoline = IntPtr.Zero;
             }
             _isInstalled = false;
+        }
+
+        // Temporary diagnostic helpers for uninstall tracing.
+        private static void DiagTrace(string msg)
+        {
+            if (Environment.GetEnvironmentVariable("DTHOOK_DIAG") == null) return;
+            try { Console.Error.WriteLine("[dthook] " + msg); Console.Error.Flush(); } catch { }
+        }
+
+        private static void DiagTraceUninstall(string msg)
+        {
+            if (Environment.GetEnvironmentVariable("DTHOOK_DIAG") == null) return;
+            try { Console.Error.WriteLine("[dthook-u] " + msg); Console.Error.Flush(); } catch { }
+        }
+        private static string ByteHex(byte[] b)
+        {
+            if (b == null) return "null";
+            var sb = new System.Text.StringBuilder(b.Length * 3);
+            for (int i = 0; i < b.Length; i++) { if (i > 0) sb.Append(' '); sb.Append(b[i].ToString("X2")); }
+            return sb.ToString();
+        }
+        private static IntPtr ReadIntPtrCellSafe(IntPtr addr)
+        {
+            if (addr == IntPtr.Zero) return IntPtr.Zero;
+            try { return Marshal.ReadIntPtr(addr); } catch { return IntPtr.Zero; }
         }
 
         private void SafeTry(string description, Action action)

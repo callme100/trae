@@ -20,14 +20,21 @@ namespace DynamicHook
             {
                 for (int i = 0; i < methodDescScanSize; i += size)
                 {
-                    long cellValue;
-                    if (!TryReadIntPtrSafe(methodDesc + i, out cellValue))
+                    if (!Memory.IsReadable(methodDesc + i, size))
                     {
                         break;
                     }
-                    if (cellValue == num || cellValue == num2)
+                    try
                     {
-                        list.Add(methodDesc + i);
+                        long num3 = MemOps.ReadIntPtr(methodDesc + i).ToInt64();
+                        if (num3 == num || num3 == num2)
+                        {
+                            list.Add(methodDesc + i);
+                        }
+                    }
+                    catch
+                    {
+                        break;
                     }
                 }
             }
@@ -36,8 +43,7 @@ namespace DynamicHook
                 int consecutiveUnreadable = 0;
                 for (int j = 0; j < 65536; j += size)
                 {
-                    long cellValue;
-                    if (!TryReadIntPtrSafe(methodTable + j, out cellValue))
+                    if (!Memory.IsReadable(methodTable + j, size))
                     {
                         // Skip unreadable regions instead of breaking. The MethodTable
                         // may span non-contiguous pages (e.g. on x86 where the vtable
@@ -49,38 +55,21 @@ namespace DynamicHook
                         continue;
                     }
                     consecutiveUnreadable = 0;
-                    if (cellValue == num || cellValue == num2)
+                    try
                     {
-                        list.Add(methodTable + j);
+                        long num4 = MemOps.ReadIntPtr(methodTable + j).ToInt64();
+                        if (num4 == num || num4 == num2)
+                        {
+                            list.Add(methodTable + j);
+                        }
+                    }
+                    catch
+                    {
+                        break;
                     }
                 }
             }
             return list;
-        }
-
-        /// <summary>
-        /// Reads an IntPtr-sized value from memory safely. Uses Memory.IsReadable
-        /// as the primary check (reliable on all platforms: VirtualQuery on Windows,
-        /// /proc/self/maps on Linux, mincore on macOS). Falls back to try/catch
-        /// around MemOps.ReadIntPtr for edge cases where IsReadable returns true
-        /// but the read still fails (e.g. race condition with page unmapping).
-        /// </summary>
-        private static bool TryReadIntPtrSafe(IntPtr addr, out long value)
-        {
-            value = 0;
-            if (!Memory.IsReadable(addr, IntPtr.Size))
-            {
-                return false;
-            }
-            try
-            {
-                value = MemOps.ReadIntPtr(addr).ToInt64();
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
         }
 
         public static void ReplaceSlot(IntPtr slot, IntPtr newValue)

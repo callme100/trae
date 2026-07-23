@@ -1,12 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "uRpfT26o3YM=",
+  "dgSpecHash": "4yPQ2xQvmN0=",
   "success": true,
-  "projectFilePath": "/workspace/DynamicHook.Tests/DynamicHook.Tests.csproj",
-  "expectedPackageFiles": [
-    "/root/.nuget/packages/microsoft.netcore.app.ref/6.0.36/microsoft.netcore.app.ref.6.0.36.nupkg.sha512",
-    "/root/.nuget/packages/microsoft.aspnetcore.app.ref/6.0.36/microsoft.aspnetcore.app.ref.6.0.36.nupkg.sha512",
-    "/root/.nuget/packages/microsoft.netcore.app.host.linux-x64/6.0.36/microsoft.netcore.app.host.linux-x64.6.0.36.nupkg.sha512"
-  ],
+  "projectFilePath": "C:\\trae\\DynamicHook.Tests\\DynamicHook.Tests.csproj",
+  "expectedPackageFiles": [],
   "logs": []
 }

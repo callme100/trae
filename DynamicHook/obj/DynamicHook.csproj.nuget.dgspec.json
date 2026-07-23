@@ -1,25 +1,31 @@
 {
   "format": 1,
   "restore": {
-    "/workspace/DynamicHook/DynamicHook.csproj": {}
+    "C:\\trae\\DynamicHook\\DynamicHook.csproj": {}
   },
   "projects": {
-    "/workspace/DynamicHook/DynamicHook.csproj": {
+    "C:\\trae\\DynamicHook\\DynamicHook.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "/workspace/DynamicHook/DynamicHook.csproj",
+        "projectUniqueName": "C:\\trae\\DynamicHook\\DynamicHook.csproj",
         "projectName": "DynamicHook",
-        "projectPath": "/workspace/DynamicHook/DynamicHook.csproj",
-        "packagesPath": "/root/.nuget/packages/",
-        "outputPath": "/workspace/DynamicHook/obj/",
+        "projectPath": "C:\\trae\\DynamicHook\\DynamicHook.csproj",
+        "packagesPath": "C:\\Users\\test\\.nuget\\packages\\",
+        "outputPath": "C:\\trae\\DynamicHook\\obj\\",
         "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
         "configFilePaths": [
-          "/root/.nuget/NuGet/NuGet.Config"
+          "C:\\Users\\test\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
         ],
         "originalTargetFrameworks": [
           "netstandard2.0"
         ],
         "sources": {
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
           "https://api.nuget.org/v3/index.json": {}
         },
         "frameworks": {
@@ -64,7 +70,7 @@
           ],
           "assetTargetFallback": true,
           "warn": true,
-          "runtimeIdentifierGraphPath": "/root/.dotnet/sdk/10.0.302/RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301\\RuntimeIdentifierGraph.json"
         }
       }
     }

@@ -73,23 +73,6 @@ namespace DynamicHook
                             foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitFromFixup, dictScanSize))
                                 if (!dictSlots.Contains(s)) dictSlots.Add(s);
                         }
-                        // After tiered promotion on .NET 8+, the generic dictionary's
-                        // code pointer slot may be updated to the tier-1 JIT code
-                        // address, which is different from all three values above.
-                        // Use _targetJitCode (resolved in Install() BEFORE slot
-                        // replacement via ScanMethodDescForJitCode) to scan the
-                        // dictionary for the tier-1 code address.
-                        IntPtr tier1Jit = _targetJitCode;
-                        if (tier1Jit != IntPtr.Zero && tier1Jit != targetPtr
-                            && Memory.IsReadable(tier1Jit, 16) && LooksLikeRealJitCode(tier1Jit))
-                        {
-                            foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, tier1Jit, dictScanSize))
-                                if (!dictSlots.Contains(s)) dictSlots.Add(s);
-                            if (dictSlots.Count > 0)
-                            {
-                                diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictTier1JitScan at 0x" + tier1Jit.ToInt64().ToString("X");
-                            }
-                        }
                         foreach (IntPtr s in dictSlots)
                         {
                             if (!_slotAddresses.Contains(s)) _slotAddresses.Add(s);
@@ -865,7 +848,8 @@ namespace DynamicHook
                 if (b0 >= 0x50 && b0 <= 0x57)
                 {
                     if (b1 >= 0x50 && b1 <= 0x57) return true;  // another PUSH
-                    if (b1 >= 0x40 && b1 <= 0x4F) return true;  // any REX prefix
+                    if (b1 == 0x48 || b1 == 0x4C) return true;  // REX prefix
+                    if (b1 == 0x40) return true;                 // REX prefix
                     return false;  // likely DATA structure
                 }
                 // Some JIT code starts with MOV or LEA
@@ -1316,25 +1300,11 @@ namespace DynamicHook
                         // to find the actual JIT code entry. This MUST be done
                         // before patching target1, otherwise ResolveRealEntry would
                         // follow our patch and resolve to the hook address.
-                        //
-                        // CRITICAL: Only accept the resolved address if it is
-                        // READABLE and looks like JIT code. On .NET 8 without
-                        // warmup, tiered promotion may have deallocated the tier-0
-                        // JIT code — ResolveRealEntry follows the jump chain to
-                        // the now-unmapped tier-0 address. Using that address
-                        // causes InnerBytes=[null] looksJit=False, and the hook
-                        // is never triggered. The warmup in EnsureJitCompiled
-                        // should prevent this, but we validate defensively.
                         IntPtr realJit = MethodEntryResolver.ResolveRealEntry(innerCodeAddr);
-                        if (realJit != IntPtr.Zero && realJit != innerCodeAddr
-                            && Memory.IsReadable(realJit, 16) && LooksLikeRealJitCode(realJit))
+                        if (realJit != IntPtr.Zero && realJit != innerCodeAddr)
                         {
                             diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; ResolvedInner->RealJit 0x" + realJit.ToInt64().ToString("X");
                             innerCodeAddr = realJit;
-                        }
-                        else if (realJit != IntPtr.Zero && realJit != innerCodeAddr)
-                        {
-                            diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; ResolvedInner->RealJit 0x" + realJit.ToInt64().ToString("X") + " UNREADABLE/skipped";
                         }
                         // On .NET Framework 4.x, <jit_addr> may point to a DATA
                         // structure (8-byte pointer to JIT code) rather than JIT
@@ -1358,26 +1328,6 @@ namespace DynamicHook
                             }
                             catch { }
                         }
-                        // On .NET 8+, after tiered promotion, the fixup thunk's
-                        // jit_addr may point to a STALE precode that references
-                        // deallocated tier-0 code (unreadable). The REAL tier-1
-                        // JIT code address was saved in _targetJitCode by Install()
-                        // (resolved via ScanMethodDescForJitCode BEFORE slot
-                        // replacement patched the MethodDesc). Use it as a fallback.
-                        if (!LooksLikeRealJitCode(innerCodeAddr))
-                        {
-                            if (_targetJitCode != IntPtr.Zero && _targetJitCode != _precodeAddr
-                                && Memory.IsReadable(_targetJitCode, 16)
-                                && LooksLikeRealJitCode(_targetJitCode))
-                            {
-                                diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; TargetJitCode->Jit 0x" + _targetJitCode.ToInt64().ToString("X");
-                                innerCodeAddr = _targetJitCode;
-                            }
-                            else
-                            {
-                                diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; TargetJitCode unusable (0x" + _targetJitCode.ToInt64().ToString("X") + ")";
-                            }
-                        }
                     }
                 }
 
@@ -1400,14 +1350,12 @@ namespace DynamicHook
                     try
                     {
                         byte[] innerBytes = MemOps.ReadBytesSafe(innerCodeAddr, 16);
-                        bool looksJit = LooksLikeRealJitCode(innerCodeAddr);
-                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; InnerCode@0x" + innerCodeAddr.ToInt64().ToString("X") + " looksJit=" + looksJit;
                         // Only patch if it looks like JIT code (not already patched,
                         // and not a DATA structure). On .NET Framework 4.x, <jit_addr>
                         // may point to a DATA structure — patching it corrupts memory.
                         if (innerBytes != null && innerBytes.Length >= 12 &&
                             (innerBytes[0] != 0x48 || innerBytes[1] != 0xB8) &&
-                            looksJit)
+                            LooksLikeRealJitCode(innerCodeAddr))
                         {
                             _innerCodeAddress = innerCodeAddr;
                             _innerCodeOriginalBytes = MemOps.ReadBytes(innerCodeAddr, 12);
@@ -1421,19 +1369,11 @@ namespace DynamicHook
                             _hasInnerCodePatch = true;
                             diag.PatchError += "; InnerCodePatch(12-byte) at 0x" + innerCodeAddr.ToInt64().ToString("X");
                         }
-                        else
-                        {
-                            diag.PatchError += "; InnerCodePatch SKIPPED (conditions not met)";
-                        }
                     }
                     catch (Exception ex)
                     {
                         diag.PatchError += "; InnerCodePatch error: " + ex.Message;
                     }
-                }
-                else
-                {
-                    diag.PatchError += "; InnerCodePatch SKIPPED (innerCodeAddr=Zero)";
                 }
             }
             catch (Exception ex)
@@ -1476,148 +1416,6 @@ namespace DynamicHook
             catch (Exception ex)
             {
                 diag.PatchError = diag.PatchError + "; Target2Patch error: " + ex.Message;
-            }
-        }
-
-        /// <summary>
-        /// Re-applies patches at a new precode address after tiered promotion
-        /// replaces the precode DURING Install(). This avoids the state corruption
-        /// caused by Uninstall→Install retries.
-        ///
-        /// Reads the new precode's FF 25 instructions to find the new target1/target2
-        /// data cells, patches them to point to the hook, and updates internal state
-        /// (_precodeAddr, _indirectTargetLoc, _target1Address, _target2Loc, etc.)
-        /// so that Uninstall and CallOriginal work correctly with the new addresses.
-        ///
-        /// Also re-scans MethodDesc/MethodTable slots for the new precode address
-        /// and patches them to point to the hook.
-        ///
-        /// Returns true if the re-patch was applied successfully.
-        /// </summary>
-        private unsafe bool RepatchAtNewPrecode(IntPtr newPrecode, IntPtr oldPrecode, HookDiagInfo diag)
-        {
-            try
-            {
-                if (!Memory.IsReadable(newPrecode, 20))
-                {
-                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: newPrecode not readable";
-                    return false;
-                }
-                byte* ptr = (byte*)newPrecode;
-                if (ptr[0] != 0xFF || ptr[1] != 0x25)
-                {
-                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: newPrecode not FF 25";
-                    return false;
-                }
-
-                IntPtr jumpTarget = _newSlotValue;
-                bool isFixupPrecode = ptr[6] == 0x4C && ptr[7] == 0x8B && ptr[8] == 0x15
-                    && ptr[13] == 0xFF && ptr[14] == 0x25;
-
-                // 1. Patch the new target1 data cell (FF 25 1st indirect target).
-                int disp1 = *(int*)(ptr + 2);
-                long newTarget1Loc = newPrecode.ToInt64() + 6 + disp1;
-                if (!Memory.IsReadable(new IntPtr(newTarget1Loc), 8))
-                {
-                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: target1Loc not readable";
-                    return false;
-                }
-                IntPtr newTarget1Value = new IntPtr(*(long*)newTarget1Loc);
-
-                // Update _indirectTargetLoc and _originalIndirectTarget for the
-                // new precode. The old values are kept for restoring the OLD
-                // precode during Uninstall (though the old precode is no longer
-                // used after tiered promotion, restoring it is still correct).
-                _indirectTargetLoc = new IntPtr(newTarget1Loc);
-                _originalIndirectTarget = newTarget1Value;
-                MemOps.WriteInt64Cell(_indirectTargetLoc, jumpTarget.ToInt64());
-                _hasIndirectPatch = true;
-                _precodeAddr = newPrecode;
-
-                // 2. For FixupPrecode (generic methods), also patch target1
-                //    fixup code (12-byte abs jump) and target2 data cell.
-                if (isFixupPrecode && _needsGenericAdapter)
-                {
-                    // Patch target1 fixup code with 12-byte absolute jump.
-                    // The fixup code address is the value stored in the target1
-                    // data cell (BEFORE we patched it above).
-                    if (newTarget1Value != IntPtr.Zero && Memory.IsReadable(newTarget1Value, 12))
-                    {
-                        // Save old target1 patch state for Uninstall (the old
-                        // target1 address is no longer used, but Uninstall needs
-                        // to restore SOMETHING — we'll just skip restoring the
-                        // old target1 since it's orphaned).
-                        _target1Address = newTarget1Value;
-                        _target1OriginalBytes = MemOps.ReadBytes(newTarget1Value, 12);
-                        byte[] patch = Jumper.BuildAbsJumpX64(jumpTarget);
-                        MemOps.WriteBytesProtected(newTarget1Value, patch);
-                        _hasTarget1Patch = true;
-                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: Target1Patch at 0x" + newTarget1Value.ToInt64().ToString("X");
-                    }
-
-                    // Patch target2 data cell.
-                    int disp3 = *(int*)(ptr + 15);
-                    long newTarget2Loc = newPrecode.ToInt64() + 19 + disp3;
-                    if (Memory.IsReadable(new IntPtr(newTarget2Loc), 8))
-                    {
-                        IntPtr newTarget2Value = new IntPtr(*(long*)newTarget2Loc);
-                        _target2Loc = new IntPtr(newTarget2Loc);
-                        _target2OriginalValue = newTarget2Value;
-                        MemOps.WriteInt64Cell(_target2Loc, jumpTarget.ToInt64());
-                        _hasTarget2Patch = true;
-                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: Target2Patch at 0x" + new IntPtr(newTarget2Loc).ToInt64().ToString("X");
-                    }
-                }
-
-                // 3. Re-scan MethodDesc/MethodTable for slots containing the new
-                //    precode address and patch them to point to the hook.
-                try
-                {
-                    IntPtr methodDesc = _targetMethod.MethodHandle.Value;
-                    IntPtr methodTable = IntPtr.Zero;
-                    Type declaringType = _targetMethod.DeclaringType;
-                    if (declaringType != null)
-                    {
-                        methodTable = declaringType.TypeHandle.Value;
-                    }
-                    IntPtr mdForScan = !_needsGenericAdapter ? methodDesc : IntPtr.Zero;
-                    var newSlots = SlotPatcher.FindSlots(mdForScan, methodTable, newPrecode);
-                    if (!_needsGenericAdapter && methodDesc != IntPtr.Zero)
-                    {
-                        long mdStart = methodDesc.ToInt64();
-                        long mdEnd = mdStart + 128;
-                        newSlots = newSlots.FindAll(s =>
-                        {
-                            long a = s.ToInt64();
-                            return a < mdStart || a >= mdEnd;
-                        });
-                    }
-                    foreach (IntPtr slot in newSlots)
-                    {
-                        if (_slotAddresses == null) _slotAddresses = new List<IntPtr>();
-                        if (!_slotAddresses.Contains(slot))
-                        {
-                            _slotAddresses.Add(slot);
-                            if (_originalSlotValues == null)
-                                _originalSlotValues = new List<IntPtr>();
-                            _originalSlotValues.Add(newPrecode); // original = new precode addr
-                            SlotPatcher.ReplaceSlot(slot, jumpTarget);
-                            diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: slot at 0x" + slot.ToInt64().ToString("X");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: slot scan error: " + ex.Message;
-                }
-
-                diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: SUCCESS at 0x" + newPrecode.ToInt64().ToString("X");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; Repatch: EXCEPTION: " + ex.Message;
-                return false;
             }
         }
 
