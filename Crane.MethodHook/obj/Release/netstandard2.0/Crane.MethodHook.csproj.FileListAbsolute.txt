@@ -1,0 +1,10 @@
+C:\trae\Crane.MethodHook\bin\Release\netstandard2.0\Crane.MethodHook.deps.json
+C:\trae\Crane.MethodHook\bin\Release\netstandard2.0\Crane.MethodHook.dll
+C:\trae\Crane.MethodHook\bin\Release\netstandard2.0\Crane.MethodHook.pdb
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.csproj.AssemblyReference.cache
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.GeneratedMSBuildEditorConfig.editorconfig
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.AssemblyInfoInputs.cache
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.AssemblyInfo.cs
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.csproj.CoreCompileInputs.cache
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.dll
+C:\trae\Crane.MethodHook\obj\Release\netstandard2.0\Crane.MethodHook.pdb

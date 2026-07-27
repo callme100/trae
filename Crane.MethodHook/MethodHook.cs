@@ -7,8 +7,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 
-[assembly: InternalsVisibleTo("DynamicHook.Tests")]
-
 namespace Crane.MethodHook
 {
     public sealed partial class MethodHook : IDisposable
@@ -474,6 +472,39 @@ namespace Crane.MethodHook
 
         private void PrepareMethod(MethodBase method)
         {
+            // For non-generic methods on constructed generic types (e.g. anonymous
+            // type ToString, List<int>.Add), RuntimeHelpers.PrepareMethod without
+            // instantiation throws ArgumentException ("The given generic
+            // instantiation was invalid.") on .NET Framework 4.x. The method handle
+            // is for the constructed type, but the API still requires the type's
+            // generic arguments to be passed explicitly. Build the instantiation
+            // from the declaring type's type arguments (and, for generic methods,
+            // the method's own type arguments) and call the overloaded PrepareMethod.
+            Type declaringType = method.DeclaringType;
+            bool isOnConstructedGenericType = declaringType != null
+                && declaringType.IsGenericType
+                && !declaringType.IsGenericTypeDefinition;
+            if (isOnConstructedGenericType)
+            {
+                try
+                {
+                    var handles = new List<RuntimeTypeHandle>();
+                    foreach (Type t in declaringType.GetGenericArguments())
+                        handles.Add(t.TypeHandle);
+                    if (method.IsGenericMethod)
+                    {
+                        foreach (Type t in method.GetGenericArguments())
+                            handles.Add(t.TypeHandle);
+                    }
+                    RuntimeHelpers.PrepareMethod(method.MethodHandle, handles.ToArray());
+                    return;
+                }
+                catch
+                {
+                    // If instantiation fails, fall through to the non-instantiated
+                    // call below (works on .NET 6+ which tolerates missing args).
+                }
+            }
             RuntimeHelpers.PrepareMethod(method.MethodHandle);
             if (!method.IsGenericMethod)
             {
