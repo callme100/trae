@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk"> 
+<PropertyGroup>
+    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+	<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	<LangVersion>latest</LangVersion>
+    <PackageId>Crane.MethodHook</PackageId>
+	<Title>Crane Method Hook</Title>
+    <Version>2.0.3</Version>
+    <Authors>壹佰</Authors>
+    <Company>Chinature</Company>
+	<Product>Crane Method Hook</Product>
+    <PackageTags>Crane Method Hook</PackageTags>
+    <Description>此库尝试通过汇编JMP指令实现.net中方法钩子。最新版通过.Net Standard 2.0以持续支持.Net 4.6.1+,.Net6/8/10/...，同步支持Windows/Linux平台。</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageOutputPath>nuget_pack</PackageOutputPath>
+    <PackageReleaseNotes>最新版通过.Net Standard 2.0以持续支持.Net 4.6.1+,.Net6/8/10/...，同步支持Windows/Linux平台。</PackageReleaseNotes>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+	<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+  </PropertyGroup> 
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup> 
+
+
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Exec Command="if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; set pdbFile=$(TargetPath)&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; set pdbFile=%25pdbFile:dll=pdb%25&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; copy &quot;%25pdbFile%25&quot; &quot;%25pdbFile%25_bak&quot;&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; Eazfuscator.NET.exe &quot;$(TargetPath)&quot; -v top&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; move /y &quot;%25pdbFile%25_bak&quot; &quot;%25pdbFile%25&quot;" />
+  </Target>
+
+
+
+</Project>
