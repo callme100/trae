@@ -209,6 +209,9 @@ namespace Crane.MethodHook
             HookDiagInfo hookDiagInfo = new HookDiagInfo();
             hookDiagInfo.TargetMethod = _targetMethod.ToString();
             hookDiagInfo.HookMethod = _hookMethod.ToString();
+            // Assign DiagInfo early so it is available for debugging even if
+            // StartHook throws before reaching the final assignment at the end.
+            DiagInfo = hookDiagInfo;
             PrepareMethod(_targetMethod);
             PrepareMethod(_hookMethod);
             // Create a delegate to the original method BEFORE any patching.
@@ -353,61 +356,73 @@ namespace Crane.MethodHook
             // during patch installation (e.g., by String.Format or other BCL methods),
             // CallOriginal can correctly restore/invoke/reapply instead of throwing.
             _isInstalled = true;
-            InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
-            // Correct _originalIndirectTarget if InstallSlotReplacement (called
-            // BEFORE InstallCodePatch) already patched the indirect data cell.
-            // SlotPatcher.FindSlots scans the MethodTable region (65536 bytes)
-            // and may find the indirect cell (at precode+disp) within that range,
-            // replacing it with the hook's jump target. When InstallCodePatch
-            // subsequently reads the cell to capture _originalIndirectTarget, it
-            // gets the hook's address instead of the true original. After
-            // RestoreAll, the cell is "restored" to the hook's address, leaving
-            // the hook active even after Uninstall — causing "Hook is not
-            // installed" errors on subsequent CallOriginal calls.
-            // Fix: if the captured original matches the hook's jump target, look
-            // up the true original from the per-slot saved values.
-            if (_indirectTargetLoc != IntPtr.Zero &&
-                _slotAddresses != null && _originalSlotValues != null &&
-                _originalIndirectTarget == _newSlotValue)
+            try
             {
-                for (int i = 0; i < _slotAddresses.Count; i++)
+                InstallCodePatch(functionPointer, intPtr, hookDiagInfo);
+                // Correct _originalIndirectTarget if InstallSlotReplacement (called
+                // BEFORE InstallCodePatch) already patched the indirect data cell.
+                // SlotPatcher.FindSlots scans the MethodTable region (65536 bytes)
+                // and may find the indirect cell (at precode+disp) within that range,
+                // replacing it with the hook's jump target. When InstallCodePatch
+                // subsequently reads the cell to capture _originalIndirectTarget, it
+                // gets the hook's address instead of the true original. After
+                // RestoreAll, the cell is "restored" to the hook's address, leaving
+                // the hook active even after Uninstall — causing "Hook is not
+                // installed" errors on subsequent CallOriginal calls.
+                // Fix: if the captured original matches the hook's jump target, look
+                // up the true original from the per-slot saved values.
+                if (_indirectTargetLoc != IntPtr.Zero &&
+                    _slotAddresses != null && _originalSlotValues != null &&
+                    _originalIndirectTarget == _newSlotValue)
                 {
-                    if (_slotAddresses[i] == _indirectTargetLoc && i < _originalSlotValues.Count)
+                    for (int i = 0; i < _slotAddresses.Count; i++)
                     {
-                        _originalIndirectTarget = _originalSlotValues[i];
-                        break;
+                        if (_slotAddresses[i] == _indirectTargetLoc && i < _originalSlotValues.Count)
+                        {
+                            _originalIndirectTarget = _originalSlotValues[i];
+                            break;
+                        }
                     }
                 }
-            }
-            // Post-install verification: on .NET 8+, tiered promotion may
-            // replace the precode DURING or shortly AFTER patch installation,
-            // orphaning our patches. Detect this by re-checking
-            // GetFunctionPointer() and the precode's first byte.
-            if (Environment.Version.Major >= 8)
-            {
-                IntPtr postFp = _targetMethod.MethodHandle.GetFunctionPointer();
-                if (postFp != IntPtr.Zero && postFp != functionPointer)
+                // Post-install verification: on .NET 8+, tiered promotion may
+                // replace the precode DURING or shortly AFTER patch installation,
+                // orphaning our patches. Detect this by re-checking
+                // GetFunctionPointer() and the precode's first byte.
+                if (Environment.Version.Major >= 8)
                 {
-                    hookDiagInfo.PatchError += "; WARNING: Precode replaced during install (0x"
-                        + functionPointer.ToInt64().ToString("X") + " -> 0x"
-                        + postFp.ToInt64().ToString("X")
-                        + "). Patches may be orphaned. Consider re-installing the hook.";
-                }
-                else if (postFp == functionPointer)
-                {
-                    // Precode address unchanged — verify the E9 instruction
-                    // patch is still in place.
-                    byte[] verify = MemOps.ReadBytesSafe(functionPointer, 2);
-                    if (verify != null && verify.Length >= 1 && verify[0] != 0xE9)
+                    IntPtr postFp = _targetMethod.MethodHandle.GetFunctionPointer();
+                    if (postFp != IntPtr.Zero && postFp != functionPointer)
                     {
-                        hookDiagInfo.PatchError += "; WARNING: Precode E9 patch lost after install"
-                            + " (first byte=0x" + verify[0].ToString("X2")
-                            + "). Tiered promotion may have overwritten the precode.";
+                        hookDiagInfo.PatchError += "; WARNING: Precode replaced during install (0x"
+                            + functionPointer.ToInt64().ToString("X") + " -> 0x"
+                            + postFp.ToInt64().ToString("X")
+                            + "). Patches may be orphaned. Consider re-installing the hook.";
+                    }
+                    else if (postFp == functionPointer)
+                    {
+                        // Precode address unchanged — verify the E9 instruction
+                        // patch is still in place.
+                        byte[] verify = MemOps.ReadBytesSafe(functionPointer, 2);
+                        if (verify != null && verify.Length >= 1 && verify[0] != 0xE9)
+                        {
+                            hookDiagInfo.PatchError += "; WARNING: Precode E9 patch lost after install"
+                                + " (first byte=0x" + verify[0].ToString("X2")
+                                + "). Tiered promotion may have overwritten the precode.";
+                        }
                     }
                 }
+                EvaluateInliningRisk(hookDiagInfo);
             }
-            EvaluateInliningRisk(hookDiagInfo);
-            DiagInfo = hookDiagInfo;
+            catch (Exception ex)
+            {
+                // InstallCodePatch failed after slot replacement was already applied.
+                // Roll back ALL patches (slots + partial code patches + trampolines)
+                // to avoid leaving the runtime in an inconsistent state where some
+                // calls are redirected (via slots) but others are not.
+                hookDiagInfo.PatchError += "; StartHook failed during InstallCodePatch: " + ex.Message;
+                try { StopHook(); } catch { /* best-effort rollback */ }
+                throw;
+            }
         }
 
         /// <summary>

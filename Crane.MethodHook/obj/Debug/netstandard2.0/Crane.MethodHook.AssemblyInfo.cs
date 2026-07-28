@@ -15,7 +15,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyDescriptionAttribute(("此库尝试通过汇编JMP指令实现.net中方法钩子。最新版通过.Net Standard 2.0以持续支持.Net 4.6.1+,.Net6/8/10/...，同步" +
     "支持Windows/Linux平台。"))]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("2.0.3.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("2.0.3+fd11e76126cedde7536415ed3717a46ad9729695")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("2.0.3+7070dd19c93c2c0922951d3a943b05ba04dfe586")]
 [assembly: System.Reflection.AssemblyProductAttribute("Crane Method Hook")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Crane.MethodHook")]
 [assembly: System.Reflection.AssemblyVersionAttribute("2.0.3.0")]

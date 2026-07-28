@@ -147,13 +147,18 @@ namespace Crane.MethodHook
             // Check slot replacements
             if (_slotAddresses != null)
             {
-                foreach (IntPtr slot in _slotAddresses)
+                for (int i = 0; i < _slotAddresses.Count; i++)
                 {
+                    IntPtr slot = _slotAddresses[i];
                     try
                     {
                         long cur = MemOps.ReadInt64(slot);
                         long want = _newSlotValue.ToInt64();
-                        long orig = _originalSlotValue.ToInt64();
+                        // Use per-slot original value (slots may have DIFFERENT
+                        // originals, e.g. precode addr vs boxed→unboxed thunk).
+                        long orig = (_originalSlotValues != null && i < _originalSlotValues.Count)
+                            ? _originalSlotValues[i].ToInt64()
+                            : 0;
                         sb.AppendLine($"Slot @0x{slot.ToInt64():X16}: cur=0x{cur:X16} want=0x{want:X16} orig=0x{orig:X16} {(cur == want ? "OK" : (cur == orig ? "RESTORED" : "OTHER"))}");
                     }
                     catch (Exception ex) { sb.AppendLine($"Slot @0x{slot.ToInt64():X16}: read error: {ex.Message}"); }

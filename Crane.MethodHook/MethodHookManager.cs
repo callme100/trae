@@ -2,101 +2,156 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 
-
 namespace Crane.MethodHook
 {
     public class MethodHookManager
     {
         public static readonly MethodHookManager Instance = new MethodHookManager();
 
-        private MethodHookManager()
-        {
-            MethodHookList = new List<MethodHook>();
-        }
-
-        private List<MethodHook> MethodHookList { get; set; }
-
+        private readonly object _lock = new object();
+        private readonly List<MethodHook> _hookList = new List<MethodHook>();
 
         /// <summary>
-        /// 启用hook
+        /// 最近一次批量操作中收集的错误(StartHook/StopHook/RemoveAllHook)。
+        /// 每次批量操作结束后原子替换。空列表表示无错误。
+        /// 单个 hook 的失败不会中断其他 hook 的处理。
+        /// </summary>
+        public IReadOnlyList<Exception> LastErrors => _lastErrors;
+        private IReadOnlyList<Exception> _lastErrors = Array.Empty<Exception>();
+
+        private MethodHookManager()
+        {
+        }
+
+        /// <summary>
+        /// 启用所有已注册的 hook。单个 hook 启动失败不会中断其他 hook,
+        /// 失败的异常收集到 <see cref="LastErrors"/>。
         /// </summary>
         public void StartHook()
         {
-            try
+            List<MethodHook> snapshot;
+            lock (_lock)
             {
-                //start hook
-                MethodHookList.ForEach(item =>
+                snapshot = new List<MethodHook>(_hookList);
+            }
+            var errors = new List<Exception>();
+            foreach (var hook in snapshot)
+            {
+                if (hook == null) continue;
+                try
                 {
-                    if (item != null)
-                    {
-                        item.StartHook();
-                    }
-                });
+                    hook.StartHook();
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
             }
-            catch (Exception)
-            {
-
-            }
+            _lastErrors = errors;
         }
 
         /// <summary>
-        /// 停用Hook
+        /// 停用所有已注册的 hook。单个 hook 停止失败不会中断其他 hook,
+        /// 失败的异常收集到 <see cref="LastErrors"/>。
         /// </summary>
         public void StopHook()
         {
-            MethodHookList.ForEach(item =>
+            List<MethodHook> snapshot;
+            lock (_lock)
             {
+                snapshot = new List<MethodHook>(_hookList);
+            }
+            var errors = new List<Exception>();
+            foreach (var hook in snapshot)
+            {
+                if (hook == null) continue;
                 try
                 {
-                    if (item != null)
-                    {
-                        item.StopHook();
-                    }
+                    hook.StopHook();
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
-
+                    errors.Add(ex);
                 }
-            });
+            }
+            _lastErrors = errors;
         }
 
         public MethodHook GetHook(MethodBase method)
         {
-            foreach (var item in MethodHookList)
+            if (method == null) return null;
+            lock (_lock)
             {
-                if (item.TargetMethod.Equals(method) || item.SourceMethod.Equals(method))
+                foreach (var item in _hookList)
                 {
-                    return item;
+                    if (item == null) continue;
+                    if (item.TargetMethod.Equals(method) || item.SourceMethod.Equals(method))
+                    {
+                        return item;
+                    }
                 }
             }
-
             return null;
         }
 
         public void AddHook(MethodHook hook)
         {
-            if (MethodHookList.Find(item => item.Equals(hook)) == null)
+            if (hook == null)
+                throw new ArgumentNullException(nameof(hook));
+            lock (_lock)
             {
-                MethodHookList.Add(hook);
+                if (!_hookList.Contains(hook))
+                {
+                    _hookList.Add(hook);
+                }
             }
         }
 
         public void RemoveHook(MethodHook hook)
         {
-            if (MethodHookList.Find(item => item.Equals(hook)) != null)
+            if (hook == null) return;
+            lock (_lock)
+            {
+                if (!_hookList.Contains(hook)) return;
+            }
+            var errors = new List<Exception>();
+            try
             {
                 hook.StopHook();
-                MethodHookList.Remove(hook);
             }
+            catch (Exception ex)
+            {
+                errors.Add(ex);
+            }
+            lock (_lock)
+            {
+                _hookList.Remove(hook);
+            }
+            _lastErrors = errors;
         }
 
         public void RemoveAllHook()
         {
-            foreach (var hook in MethodHookList)
+            List<MethodHook> snapshot;
+            lock (_lock)
             {
-                hook.StopHook();
+                snapshot = new List<MethodHook>(_hookList);
+                _hookList.Clear();
             }
-            MethodHookList.Clear();
+            var errors = new List<Exception>();
+            foreach (var hook in snapshot)
+            {
+                if (hook == null) continue;
+                try
+                {
+                    hook.StopHook();
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                }
+            }
+            _lastErrors = errors;
         }
     }
 }
