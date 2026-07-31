@@ -15,9 +15,13 @@ namespace Crane.MethodHook
         /// 最近一次批量操作中收集的错误(StartHook/StopHook/RemoveAllHook)。
         /// 每次批量操作结束后原子替换。空列表表示无错误。
         /// 单个 hook 的失败不会中断其他 hook 的处理。
+        ///
+        /// 使用 volatile 确保跨线程可见性：批量操作在 _lock 内写入，
+        /// 但 LastErrors 属性可能在任意线程无锁读取。volatile 保证
+        /// 读取到最新的引用，不会读取到部分更新的状态。
         /// </summary>
         public IReadOnlyList<Exception> LastErrors => _lastErrors;
-        private IReadOnlyList<Exception> _lastErrors = Array.Empty<Exception>();
+        private volatile IReadOnlyList<Exception> _lastErrors = Array.Empty<Exception>();
 
         private MethodHookManager()
         {

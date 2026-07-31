@@ -19,11 +19,13 @@ namespace Crane.MethodHook
 
         public List<long> SlotAddresses;
 
-        public string SlotError;
+        // Initialize string fields to empty string to avoid null reference issues
+        // when concatenating with += throughout the patching logic.
+        public string SlotError = string.Empty;
 
-        public string PatchType;
+        public string PatchType = string.Empty;
 
-        public string PatchError;
+        public string PatchError = string.Empty;
 
         public bool NeedsGenericAdapter;
 
@@ -49,9 +51,9 @@ namespace Crane.MethodHook
 
         public byte[] MethodDescDump;
 
-        public string DelegateStatus;
+        public string DelegateStatus = string.Empty;
 
-        public string CallOrigStatus;
+        public string CallOrigStatus = string.Empty;
 
         /// <summary>
         /// Indicates what kind of code the patch was applied to:
@@ -64,7 +66,7 @@ namespace Crane.MethodHook
         /// "Slot"    — the patch targets a MethodTable slot.
         /// "None"    — no code patch was installed (relies on slot replacement).
         /// </summary>
-        public string PatchTarget;
+        public string PatchTarget = string.Empty;
 
         /// <summary>
         /// True when the patch was applied to raw JIT code (PatchTarget == "JitCode")
@@ -83,7 +85,7 @@ namespace Crane.MethodHook
         /// including the target method's IL size and the workaround (invoke the
         /// method through a delegate, which the JIT cannot inline).
         /// </summary>
-        public string InliningRiskMessage;
+        public string InliningRiskMessage = string.Empty;
 
         /// <summary>Hook method's precode address (from GetFunctionPointer).</summary>
         public IntPtr HookPrecodeAddr;
@@ -110,8 +112,8 @@ namespace Crane.MethodHook
             {
                 stringBuilder.AppendLine("Slot error:    " + SlotError);
             }
-            stringBuilder.AppendLine("Patch type:    " + (PatchType ?? "none"));
-            stringBuilder.AppendLine("Patch target:  " + (PatchTarget ?? "unknown"));
+            stringBuilder.AppendLine("Patch type:    " + (string.IsNullOrEmpty(PatchType) ? "none" : PatchType));
+            stringBuilder.AppendLine("Patch target:  " + (string.IsNullOrEmpty(PatchTarget) ? "unknown" : PatchTarget));
             if (InliningRisk)
             {
                 stringBuilder.AppendLine("InliningRisk:  True");
@@ -128,6 +130,8 @@ namespace Crane.MethodHook
                 stringBuilder.AppendLine($"Adapter:       0x{AdapterAddr.ToInt64():X16}  Bytes: {FormatBytes(AdapterBytes)}");
             }
             stringBuilder.AppendLine($"JumpTarget:    0x{JumpTargetAddr.ToInt64():X16}");
+            stringBuilder.AppendLine($"HookPrecode:   0x{HookPrecodeAddr.ToInt64():X16}  Bytes: {FormatBytes(HookPrecodeBytes)}");
+            stringBuilder.AppendLine($"HookResolved:  0x{HookResolvedEntry.ToInt64():X16}");
             stringBuilder.AppendLine("Installed:     Bytes: " + FormatBytes(InstalledBytes));
             if (JitCodeAddr != IntPtr.Zero)
             {
@@ -160,6 +164,18 @@ namespace Crane.MethodHook
                 stringBuilder.AppendLine("CallOrig:      " + CallOrigStatus);
             }
             return stringBuilder.ToString();
+        }
+
+        /// <summary>
+        /// Appends a tagged exception message to <see cref="PatchError"/> for
+        /// diagnostic purposes. Used by resolver/patching methods that catch
+        /// exceptions and return a default value — without this, the failure
+        /// is silently swallowed and the root cause is very hard to diagnose.
+        /// </summary>
+        public void AppendPatchError(string tag, Exception ex)
+        {
+            if (ex == null) return;
+            PatchError += "; " + tag + ": " + ex.Message;
         }
 
         private static string FormatBytes(byte[] bytes)

@@ -8,22 +8,36 @@ namespace Crane.MethodHook
     {
         public object InvokeOriginal(object instance, params object[] args)
         {
+            if (_isDisposed)
+            {
+                throw new ObjectDisposedException("MethodHook");
+            }
             if (!_isInstalled)
             {
                 throw new InvalidOperationException("Hook is not installed");
             }
             // Re-entrancy guard: if InvokeOriginal is already in progress on this
-            // hook instance, the delegate's Invoke method has re-entered the hook
-            // through a patched MethodTable slot (observed on .NET 8+ for CoreLib
-            // methods when tiered compilation is disabled, e.g., debugger attached).
-            // Throw instead of recursing into a stack overflow / AccessViolationException.
+            // hook instance, the hook has been re-entered through a still-patched
+            // code path (observed on .NET 8+ Debug mode when tiered compilation is
+            // disabled and RestoreAll partially restores patches).
+            //
+            // MUST return null immediately — NEVER throw. On .NET 8 Debug mode,
+            // the CLR's tier-0 dispatch stubs CATCH and RETRY exceptions in a tight
+            // loop, causing an infinite hang. Returning null breaks the cycle.
+            //
+            // CRITICAL: No file I/O or string allocation in this guard. Any
+            // allocation can trigger GC/JIT that calls through still-patched
+            // code paths, causing cascading re-entrancy.
             if (_inCallOriginal)
             {
-                throw new InvalidOperationException(
-                    "InvokeOriginal re-entrancy detected: the delegate's Invoke method "
-                    + "dispatched through a patched slot and re-entered the hook. "
-                    + "This typically occurs on .NET 8+ with a debugger attached "
-                    + "(tiered compilation disabled). Use MethodInfo.Invoke path instead.");
+                _reentrancyCount++;
+                if (_reentrancyCount > HookConstants.MaxReentrancyCount)
+                {
+                    // Hard stop: too many re-entries. Return null silently to
+                    // break any remaining cycle without further allocation.
+                    return null;
+                }
+                return null;
             }
             MethodInfo methodInfo = _targetMethod as MethodInfo;
             if (methodInfo == null)
@@ -45,57 +59,49 @@ namespace Crane.MethodHook
                 throw new NotSupportedException("CallOriginal supports at most 4 arguments; actual: " + argCount);
             }
 
+            _reentrancyCount = 0;
             _inCallOriginal = true;
             try
             {
                 // Path 0: for generic methods, use RestoreAll + invoke + ReapplyAll.
-                // Prefer the delegate's Invoke method (via delegate*) over MethodInfo.Invoke,
-                // because RuntimeMethodHandle.InvokeMethod (used by MethodInfo.Invoke) does not
-                // set up the generic dictionary for E9/DirectJump precodes on .NET Framework 4.x,
-                // causing AccessViolationException. The delegate's Invoke method is JIT-compiled
-                // with full knowledge of the generic arguments and correctly sets up the generic
-                // dictionary (R10 on CoreCLR, RDX on .NET Framework 4.x) before calling the precode.
-                // delegate* (managed function pointer) keeps the thread in cooperative GC mode,
-                // so object references are properly GC-tracked.
+                //
+                // IMPORTANT: Use DynamicInvoke (RuntimeMethodHandle.InvokeMethod) instead of
+                // the delegate's Invoke method via delegate*. The delegate's Invoke method is
+                // never invoked during setup (CreateOriginalDelegate only captures its function
+                // pointer via PrepareMethod). On .NET 8 Debug mode with tiered compilation,
+                // the delegate's Invoke remains tier-0 compiled. Tier-0 code contains
+                // exception handling stubs that CATCH and RETRY on failure.
+                //
+                // DynamicInvoke uses RuntimeMethodHandle.InvokeMethod (native), which does
+                // NOT have tiered compilation stubs and will NOT retry.
                 //
                 // MUST run on the SAME thread as the hook (not a clean thread).
-                // delegate* (calli) with managed calling convention requires the caller's
-                // stack to have proper GC-tracked frames for the object references passed
-                // as arguments. Running on a new thread (InvokeOnCleanThread) breaks this —
-                // the GC cannot find the object references during a GC triggered inside
-                // ConvertAll (e.g. when allocating the result List), causing
-                // AccessViolationException. After RestoreAll, ALL patches are removed,
-                // so there is no re-entrancy risk (the hook cannot re-trigger).
+                //
+                // CRITICAL: No file I/O between RestoreAll and the invoke call.
+                // Any allocation in this window can trigger GC/JIT that calls
+                // through still-patched code paths, causing re-entrancy.
                 if (_needsGenericAdapter)
                 {
                     RestoreAll();
                     try
                     {
-                        // MethodInfo.Invoke crashes with 0x80131506 for hooked generic
-                        // methods on ALL frameworks:
-                        // - .NET Framework 4.x: RuntimeMethodHandle.InvokeMethod does not
-                        //   set up the generic dictionary for E9/DirectJump precodes.
-                        // - .NET 6+: The CLR's internal type-checking code path
-                        //   (RuntimeTypeHandle.IsInstanceOfType) crashes after the JIT
-                        //   code has been patched and restored, even though the original
-                        //   bytes are restored correctly.
-                        //
-                        // The delegate's Invoke method is JIT-compiled with full knowledge
-                        // of the generic arguments and correctly sets up the generic
-                        // dictionary (R10 on CoreCLR, RDX on .NET Framework 4.x) before
-                        // calling the precode. delegate* (managed function pointer) keeps
-                        // the thread in cooperative GC mode, so object references are
-                        // properly GC-tracked. At the ABI level, all reference type
-                        // parameters use the same calling convention (object pointer in
-                        // RCX/RDX/R8/R9), so delegate*<object,...> is compatible with the
-                        // delegate's Invoke method regardless of its concrete parameter
-                        // types.
-                        if (_delegateInvokeFptr != IntPtr.Zero && _originalDelegate != null
-                            && CanUseTrampoline(methodInfo))
+                        if (_originalDelegate != null)
                         {
-                            return InvokeViaDelegateFptr(methodInfo, instance, args);
+                            object[] dlgArgs;
+                            if (methodInfo.IsStatic)
+                            {
+                                dlgArgs = args ?? Array.Empty<object>();
+                            }
+                            else
+                            {
+                                dlgArgs = new object[(args?.Length ?? 0) + 1];
+                                dlgArgs[0] = instance;
+                                if (args != null) Array.Copy(args, 0, dlgArgs, 1, args.Length);
+                            }
+                            var result = _originalDelegate.DynamicInvoke(dlgArgs);
+                            return result;
                         }
-                        // Fallback: MethodInfo.Invoke (may crash with 0x80131506)
+                        // Fallback: MethodInfo.Invoke
                         if (methodInfo.IsStatic)
                             return methodInfo.Invoke(null, args);
                         return methodInfo.Invoke(instance, args);
@@ -177,11 +183,6 @@ namespace Crane.MethodHook
                         }
                     }
                 }
-                else
-                {
-
-                }
-
                 // Path 1: cached delegate's Invoke via function pointer.
                 // For generic methods, DynamicInvoke goes through
                 // RuntimeMethodHandle.InvokeMethod which crashes (0x80131506).

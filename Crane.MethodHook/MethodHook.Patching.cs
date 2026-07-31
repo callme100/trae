@@ -13,6 +13,21 @@ namespace Crane.MethodHook
             // Try slot replacement in addition to precode/JIT patches. The CLR may use
             // MethodDesc/MethodTable slots to dispatch method calls (esp. generic methods
             // whose call sites bypass the precode and call JIT code directly).
+            //
+            // SKIP for generic methods: the brute-force memory scan (FindSlots) can
+            // produce false positives — data fields in the MethodTable or generic
+            // dictionary that happen to contain the same address as a function pointer.
+            // Patching these false positives corrupts runtime state and causes hangs.
+            // For generic methods, the precode patches (target1 data cell, target2 data
+            // cell, fixup thunk, and Target2JitPatch) are sufficient to redirect calls.
+            if (_needsGenericAdapter)
+            {
+                _slotAddresses = new List<IntPtr>();
+                _originalSlotValues = new List<IntPtr>();
+                diag.SlotCount = 0;
+                diag.CallOrigStatus = "Skipped for generic method (precode patches sufficient)";
+                return;
+            }
             try
             {
                 IntPtr methodDesc = _targetMethod.MethodHandle.Value;
@@ -50,33 +65,59 @@ namespace Crane.MethodHook
                     diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictAddr=0x" + genDictAddr.ToInt64().ToString("X");
                     if (genDictAddr != IntPtr.Zero)
                     {
-                        // Search for multiple possible code pointer values in the
-                        // generic dictionary:
-                        // 1. targetPtr (precode address) — what the slot initially holds
-                        // 2. ResolveRealEntry(targetPtr) — the fixup thunk address
-                        // 3. TryResolveFixupToJitCode(fixup thunk) — the <jit_addr>
-                        //    field, which may be PRESTUB (cold) or real JIT code (warm)
-                        // Generic dictionaries can be large (hundreds of slots), so
-                        // scan up to 8192 bytes.
-                        const int dictScanSize = 8192;
-                        IntPtr fixupThunk = MethodEntryResolver.ResolveRealEntry(targetPtr);
-                        var dictSlots = SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, targetPtr, dictScanSize);
-                        if (fixupThunk != IntPtr.Zero && fixupThunk != targetPtr)
+                        // The generic dictionary slot may hold ANY address in the
+                        // resolution chain: precode, fixup thunk, stub, or JIT code.
+                        // We must search for ALL of them, because the CLR backpatches
+                        // the slot to different values at different stages:
+                        //   1. Initial: precode address
+                        //   2. After first call (fixup runs): fixup thunk jumps to stub
+                        //   3. After backpatch: stub address or JIT code address
+                        // Previously we only searched for the first (precode) and last
+                        // (ResolveRealEntry = JIT code), missing the intermediate stub
+                        // address — causing the dictionary slot to remain unpatched
+                        // and the hook to be bypassed on direct calls.
+                        const int dictScanSize = HookConstants.GenericDictScanSize;
+                        var chain = MethodEntryResolver.ResolveChain(targetPtr);
+                        var dictSlots = new List<IntPtr>();
+                        foreach (var addr in chain)
                         {
-                            foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, fixupThunk, dictScanSize))
+                            if (addr == IntPtr.Zero) continue;
+                            foreach (var s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, addr, dictScanSize))
                                 if (!dictSlots.Contains(s)) dictSlots.Add(s);
                         }
-                        IntPtr jitFromFixup = TryResolveFixupToJitCode(fixupThunk);
-                        if (jitFromFixup != IntPtr.Zero && jitFromFixup != targetPtr && jitFromFixup != fixupThunk)
+                        // Also try TryResolveFixupToJitCode on the REAL fixup thunk
+                        // (the first hop after the precode, not the final JIT code).
+                        // ResolveChain[0] = precode, [1] = fixup thunk, [2] = stub, ...
+                        if (chain.Count >= 2)
                         {
-                            foreach (IntPtr s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitFromFixup, dictScanSize))
-                                if (!dictSlots.Contains(s)) dictSlots.Add(s);
+                            IntPtr jitFromFixup = TryResolveFixupToJitCode(chain[1]);
+                            if (jitFromFixup != IntPtr.Zero)
+                            {
+                                foreach (var s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitFromFixup, dictScanSize))
+                                    if (!dictSlots.Contains(s)) dictSlots.Add(s);
+                            }
                         }
                         foreach (IntPtr s in dictSlots)
                         {
                             if (!_slotAddresses.Contains(s)) _slotAddresses.Add(s);
                         }
-                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictScan at 0x" + genDictAddr.ToInt64().ToString("X") + " found " + dictSlots.Count + " slots";
+                        // Diagnostic: dump first 32 slots (256 bytes) of the generic
+                        // dictionary to see what code-pointer values it holds.
+                        try
+                        {
+                            var dump = new System.Text.StringBuilder();
+                            dump.Append("GenDictDump@0x").Append(genDictAddr.ToInt64().ToString("X")).Append(":");
+                            for (int i = 0; i < 256; i += 8)
+                            {
+                                if (!Memory.IsReadable(genDictAddr + i, 8)) break;
+                                long v = MemOps.ReadIntPtr(genDictAddr + i).ToInt64();
+                                if (v != 0)
+                                    dump.Append(" [").Append(i / 8).Append("]=0x").Append(v.ToString("X"));
+                            }
+                            diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; " + dump;
+                        }
+                        catch { }
+                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictScan at 0x" + genDictAddr.ToInt64().ToString("X") + " found " + dictSlots.Count + " slots; chain=" + chain.Count;
                     }
                 }
 
@@ -107,6 +148,24 @@ namespace Crane.MethodHook
                     _originalSlotValues.Add(originalValue);
                     SlotPatcher.ReplaceSlot(slotAddress, jumpTarget);
                 }
+                // Post-install verification: re-read each slot to verify the patch
+                // was actually applied and not immediately overwritten by the CLR
+                // (e.g., by tiered compilation backpatching).
+                try
+                {
+                    var verify = new System.Text.StringBuilder();
+                    verify.Append("SlotVerify:");
+                    for (int i = 0; i < _slotAddresses.Count; i++)
+                    {
+                        IntPtr after = MemOps.ReadIntPtr(_slotAddresses[i]);
+                        bool ok = after == jumpTarget;
+                        verify.Append(" [").Append(i).Append("]@0x").Append(_slotAddresses[i].ToInt64().ToString("X"))
+                              .Append("=0x").Append(after.ToInt64().ToString("X"))
+                              .Append(ok ? "(OK)" : "(CHANGED!)");
+                    }
+                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; " + verify;
+                }
+                catch { }
             }
             catch (Exception ex)
             {
@@ -134,15 +193,15 @@ namespace Crane.MethodHook
         private static unsafe int MatchFixupThunkPrefix(byte* f)
         {
             // Windows x64: 49 89 D0 48 BA ... 48 B8 ...
-            if (f[0] == 0x49 && f[1] == 0x89 && f[2] == 0xD0 &&
-                f[3] == 0x48 && f[4] == 0xBA &&
-                f[13] == 0x48 && f[14] == 0xB8)
-                return 5;
+            if (f[0] == HookConstants.Op49 && f[1] == 0x89 && f[2] == 0xD0 &&
+                f[3] == HookConstants.Op48 && f[4] == HookConstants.OpBA &&
+                f[13] == HookConstants.Op48 && f[14] == HookConstants.OpB8)
+                return HookConstants.FixupThunkDictOffset;
             // Unix x64 (Linux/macOS): 48 89 F2 48 BE ... 48 B8 ...
-            if (f[0] == 0x48 && f[1] == 0x89 && f[2] == 0xF2 &&
-                f[3] == 0x48 && f[4] == 0xBE &&
-                f[13] == 0x48 && f[14] == 0xB8)
-                return 5;
+            if (f[0] == HookConstants.Op48 && f[1] == 0x89 && f[2] == 0xF2 &&
+                f[3] == HookConstants.Op48 && f[4] == HookConstants.OpBE &&
+                f[13] == HookConstants.Op48 && f[14] == HookConstants.OpB8)
+                return HookConstants.FixupThunkDictOffset;
             return -1;
         }
 
@@ -198,34 +257,28 @@ namespace Crane.MethodHook
                 if (dictAddr == 0) return IntPtr.Zero;
                 return new IntPtr(dictAddr);
             }
-            catch
+            catch (Exception ex)
             {
+                DiagInfo?.AppendPatchError("ExtractGenericDictionaryFromFixup", ex);
                 return IntPtr.Zero;
             }
         }
 
         private void InstallCodePatch(IntPtr targetPtr, IntPtr jumpTarget, HookDiagInfo diag)
         {
-            try
+            switch (Platform.Current)
             {
-                switch (Platform.Current)
-                {
-                    case Platform.Arch.X64:
-                        InstallCodePatchX64(targetPtr, jumpTarget, diag);
-                        return;
-                    case Platform.Arch.X86:
-                        InstallCodePatchX86(targetPtr, jumpTarget, diag);
-                        return;
-                }
-                _patchType = 3;
-                _patchAddress = targetPtr;
-                _originalBytes = Jumper.Install(targetPtr, jumpTarget);
-                diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, _originalBytes.Length);
+                case Platform.Arch.X64:
+                    InstallCodePatchX64(targetPtr, jumpTarget, diag);
+                    return;
+                case Platform.Arch.X86:
+                    InstallCodePatchX86(targetPtr, jumpTarget, diag);
+                    return;
             }
-            catch (Exception ex)
-            {
-                diag.PatchError = ex.Message;
-            }
+            _patchType = HookConstants.PatchTypeAbsolute;
+            _patchAddress = targetPtr;
+            _originalBytes = Jumper.Install(targetPtr, jumpTarget);
+            diag.InstalledBytes = MemOps.ReadBytesSafe(targetPtr, _originalBytes.Length);
         }
 
         private unsafe void InstallCodePatchX64(IntPtr targetPtr, IntPtr jumpTarget, HookDiagInfo diag)
@@ -274,7 +327,7 @@ namespace Crane.MethodHook
                     // Patch precode target1 → hook (for delegate.Invoke path)
                     int num2g = *(int*)(ptr + 2);
                     long num3g = targetPtr.ToInt64() + 6 + num2g;
-                    _patchType = 1;
+                    _patchType = HookConstants.PatchTypeIndirect;
                     _patchAddress = targetPtr;
                     _indirectTargetLoc = new IntPtr(num3g);
                     _originalIndirectTarget = new IntPtr(*(long*)num3g);
@@ -342,7 +395,7 @@ namespace Crane.MethodHook
                     {
                         byte[] absJump = Jumper.BuildAbsJumpX64(jumpTarget);
                         MemOps.WriteBytes(_nearTrampoline, absJump);
-                        _patchType = 2;
+                        _patchType = HookConstants.PatchTypeInstruction;
                         _patchAddress = targetPtr;
                         _originalBytes = MemOps.ReadBytes(targetPtr, 6);
                         byte[] relJump = Jumper.BuildRelJump(targetPtr, _nearTrampoline);
@@ -352,7 +405,7 @@ namespace Crane.MethodHook
                     else
                     {
                         // Fallback: data cell patch only (less robust on .NET 8+)
-                        _patchType = 1;
+                        _patchType = HookConstants.PatchTypeIndirect;
                         diag.PatchType = (flag ? "Indirect(FF 25 1st, FixupPrecode) + JIT(E9)" : "Indirect(FF 25) + JIT(E9)");
                         diag.PatchError += "; NearTrampoline alloc failed, data-cell patch only";
                     }
@@ -448,7 +501,7 @@ namespace Crane.MethodHook
                 }
                 byte[] array = Jumper.BuildAbsJumpX64(jumpTarget);
                 MemOps.WriteBytes(_nearTrampoline, array);
-                _patchType = 2;
+                _patchType = HookConstants.PatchTypeInstruction;
                 _patchAddress = targetPtr;
                 _originalBytes = MemOps.ReadBytes(targetPtr, 6);
                 int value = (int)(_nearTrampoline.ToInt64() - (targetPtr.ToInt64() + 5));
@@ -474,7 +527,7 @@ namespace Crane.MethodHook
                 // works, call the method via a delegate (Func<...>) which the
                 // JIT cannot inline.
                 diag.PatchTarget = "JitCode";
-                _patchType = 3;
+                _patchType = HookConstants.PatchTypeAbsolute;
                 _patchAddress = targetPtr;
                 // Save full 32-byte original for potential CallOriginal trampoline.
                 _innerCodeAddress = targetPtr;
@@ -489,7 +542,7 @@ namespace Crane.MethodHook
                 if (intPtr != IntPtr.Zero && intPtr != targetPtr && !MethodEntryResolver.IsJump(intPtr))
                 {
                     diag.PatchTarget = "JitCode(resolved)";
-                    _patchType = 3;
+                    _patchType = HookConstants.PatchTypeAbsolute;
                     _patchAddress = intPtr;
                     _innerCodeAddress = intPtr;
                     _innerCodeOriginalBytesFull = MemOps.ReadBytesSafe(intPtr, 32);
@@ -535,7 +588,11 @@ namespace Crane.MethodHook
                 if (MatchFixupThunkPrefix(f) < 0) return IntPtr.Zero;
                 return new IntPtr(fixupAddr);
             }
-            catch { return IntPtr.Zero; }
+            catch (Exception ex)
+            {
+                DiagInfo?.AppendPatchError("ResolveFixupThunkFromPrecode", ex);
+                return IntPtr.Zero;
+            }
         }
 
         private unsafe bool TryPatchFixupThunkJitAddr(IntPtr precodeAddr, IntPtr jumpTarget, HookDiagInfo diag)
@@ -559,8 +616,9 @@ namespace Crane.MethodHook
                 diag.PatchError += "; FixupThunk <jit_addr> patched at 0x" + _fixupJitAddrLoc.ToInt64().ToString("X") + " (orig=0x" + _fixupJitAddrOriginal.ToInt64().ToString("X") + ")";
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                diag.AppendPatchError("TryPatchFixupThunkJitAddr", ex);
                 return false;
             }
         }
@@ -756,8 +814,9 @@ namespace Crane.MethodHook
                 }
                 return IntPtr.Zero;
             }
-            catch
+            catch (Exception ex)
             {
+                DiagInfo?.AppendPatchError("ScanMethodDescForJitCode", ex);
                 return IntPtr.Zero;
             }
         }
@@ -784,8 +843,9 @@ namespace Crane.MethodHook
                 if (jitAddr == 0) return IntPtr.Zero;
                 return new IntPtr(jitAddr);
             }
-            catch
+            catch (Exception ex)
             {
+                DiagInfo?.AppendPatchError("TryResolveFixupToJitCode", ex);
                 return IntPtr.Zero;
             }
         }
@@ -856,8 +916,9 @@ namespace Crane.MethodHook
                 // If not recognized, be conservative — don't patch
                 return false;
             }
-            catch
+            catch (Exception ex)
             {
+                DiagInfo?.AppendPatchError("LooksLikeRealJitCode", ex);
                 return false;
             }
         }
@@ -889,8 +950,9 @@ namespace Crane.MethodHook
                 }
                 return IntPtr.Zero;
             }
-            catch
+            catch (Exception ex)
             {
+                DiagInfo?.AppendPatchError("TryResolveFixupToJitCodeX86", ex);
                 return IntPtr.Zero;
             }
         }
@@ -1382,6 +1444,40 @@ namespace Crane.MethodHook
         }
 
         /// <summary>
+        /// Reads the target2 value (the shared fixup helper address) from a
+        /// CoreCLR x64 FixupPrecode. The FixupPrecode layout is:
+        ///   FF 25 <disp1>  JMP [target1]   (offset 0)
+        ///   4C 8B 15 <d2>  MOV R10,[MD]    (offset 6)
+        ///   FF 25 <disp3>  JMP [target2]   (offset 13)
+        /// The target2 data cell is at precodeAddr + 19 + disp3, where disp3 is
+        /// the 4-byte signed int at precode offset 15. In CoreCLR, target2 points
+        /// to the SHARED FixupPrecode::Fixup helper — the same address for ALL
+        /// precodes. Returns IntPtr.Zero if the precode is not a FixupPrecode or
+        /// the target2 cell cannot be read.
+        /// </summary>
+        private unsafe IntPtr ReadFixupPrecodeTarget2(IntPtr precodeAddr)
+        {
+            if (!Memory.IsReadable(precodeAddr, 19)) return IntPtr.Zero;
+            try
+            {
+                byte* p = (byte*)precodeAddr;
+                // Verify FixupPrecode signature: FF 25 ... 4C 8B 15 ... FF 25
+                if (p[0] != 0xFF || p[1] != 0x25) return IntPtr.Zero;
+                if (p[6] != 0x4C || p[7] != 0x8B || p[8] != 0x15) return IntPtr.Zero;
+                if (p[13] != 0xFF || p[14] != 0x25) return IntPtr.Zero;
+                int disp3 = *(int*)(p + 15);
+                long target2Loc = precodeAddr.ToInt64() + 19 + disp3;
+                if (!Memory.IsReadable(new IntPtr(target2Loc), 8)) return IntPtr.Zero;
+                return new IntPtr(*(long*)target2Loc);
+            }
+            catch (Exception ex)
+            {
+                DiagInfo?.AppendPatchError("ReadFixupPrecodeTarget2", ex);
+                return IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
         /// Patches the precode's second FF 25 data cell (Precode2ndTarget).
         /// For generic methods with FixupPrecode, the precode layout is:
         ///   FF 25 <disp1>  JMP [target1]   (offset 0)
@@ -1411,6 +1507,59 @@ namespace Crane.MethodHook
                 MemOps.WriteInt64Cell(target2LocPtr, jumpTarget.ToInt64());
                 _hasTarget2Patch = true;
                 diag.PatchError += "; Target2Patch(data cell) at 0x" + target2LocPtr.ToInt64().ToString("X") + " orig=0x" + originalTarget2.ToInt64().ToString("X");
+
+                // Also patch the JIT code at the target2 address when it is
+                // method-specific JIT code (not the shared fixup helper).
+                //
+                // CRITICAL: In CoreCLR, a FixupPrecode's target2 (second FF 25)
+                // points to the SHARED FixupPrecode::Fixup helper — the SAME
+                // address for ALL precodes. Patching this shared address with a
+                // method-specific absolute jump corrupts every precode that
+                // dispatches through it. In .NET 8 Debug + tiered compilation ON
+                // (no debugger), the hook method's own precode is not yet tier-1
+                // backpatched and dispatches through this shared helper, creating
+                // an infinite loop: adapter -> hook precode -> shared helper
+                // (patched) -> adapter -> ... The process hangs.
+                //
+                // Backpatched call sites call target1's JIT code (covered by
+                // InnerCodePatch), NOT target2 (the shared helper). So patching
+                // target2 is both harmful (corrupts shared state) and unnecessary.
+                // Guard against the shared helper using _sharedFixupHelperAddr
+                // (read from the hook's own precode target2 data cell).
+                if (originalTarget2 != IntPtr.Zero && originalTarget2 != jumpTarget
+                    && originalTarget2 != _innerCodeAddress
+                    && originalTarget2 != _target1Address
+                    && originalTarget2 != _sharedFixupHelperAddr
+                    && Memory.IsReadable(originalTarget2, 16))
+                {
+                    try
+                    {
+                        byte[] t2Bytes = MemOps.ReadBytesSafe(originalTarget2, 16);
+                        // Only patch if it looks like JIT code (not already
+                        // patched, and not a data structure). Avoid patching
+                        // if it starts with 48 B8 (our own abs jump pattern).
+                        if (t2Bytes != null && t2Bytes.Length >= 12 &&
+                            (t2Bytes[0] != 0x48 || t2Bytes[1] != 0xB8) &&
+                            LooksLikeRealJitCode(originalTarget2))
+                        {
+                            _target2JitAddress = originalTarget2;
+                            _target2JitOriginalBytes = MemOps.ReadBytes(originalTarget2, 12);
+                            byte[] t2Patch = Jumper.BuildAbsJumpX64(jumpTarget);
+                            MemOps.WriteBytesProtected(originalTarget2, t2Patch);
+                            _hasTarget2JitPatch = true;
+                            diag.PatchError += "; Target2JitPatch(12-byte) at 0x" + originalTarget2.ToInt64().ToString("X");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        diag.PatchError += "; Target2JitPatch error: " + ex.Message;
+                    }
+                }
+                else if (originalTarget2 == _sharedFixupHelperAddr && _sharedFixupHelperAddr != IntPtr.Zero)
+                {
+                    diag.PatchError += "; Target2JitPatch skipped: originalTarget2 is shared fixup helper (0x"
+                        + originalTarget2.ToInt64().ToString("X") + ")";
+                }
             }
             catch (Exception ex)
             {
@@ -1431,7 +1580,7 @@ namespace Crane.MethodHook
             if (b == 0xFF && b2 == 0x25)
             {
                 int num = *(int*)(ptr + 2);
-                _patchType = 1;
+                _patchType = HookConstants.PatchTypeIndirect;
                 _patchAddress = targetPtr;
                 _indirectTargetLoc = new IntPtr(num);
                 if (!Memory.IsReadable(new IntPtr(num), 4))
@@ -1453,7 +1602,7 @@ namespace Crane.MethodHook
                 {
                     InstallSecondaryJitPatchX86(targetPtr, jumpTarget, diag);
                 }
-                _patchType = 2;
+                _patchType = HookConstants.PatchTypeInstruction;
                 _patchAddress = targetPtr;
                 _originalBytes = MemOps.ReadBytes(targetPtr, 5);
                 byte[] array = Jumper.BuildJump(targetPtr, jumpTarget);
@@ -1481,7 +1630,7 @@ namespace Crane.MethodHook
                 }
                 if (jitAddr != IntPtr.Zero && !MethodEntryResolver.IsJump(jitAddr))
                 {
-                    _patchType = 3;
+                    _patchType = HookConstants.PatchTypeAbsolute;
                     _patchAddress = jitAddr;
                     _originalBytes = Jumper.Install(jitAddr, jumpTarget);
                     diag.PatchType = "B8Precode->JitCode(5-byte) x86";
@@ -1490,7 +1639,7 @@ namespace Crane.MethodHook
                 else
                 {
                     // Fallback: patch the precode itself
-                    _patchType = 3;
+                    _patchType = HookConstants.PatchTypeAbsolute;
                     _patchAddress = targetPtr;
                     _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                     diag.PatchType = "B8Precode(fallback 5-byte) x86";
@@ -1499,7 +1648,7 @@ namespace Crane.MethodHook
             }
             else if (!MethodEntryResolver.IsJump(targetPtr))
             {
-                _patchType = 3;
+                _patchType = HookConstants.PatchTypeAbsolute;
                 _patchAddress = targetPtr;
                 _originalBytes = Jumper.Install(targetPtr, jumpTarget);
                 diag.PatchType = "JitCode(5-byte) x86";
@@ -1510,7 +1659,7 @@ namespace Crane.MethodHook
                 IntPtr intPtr = MethodEntryResolver.ResolveRealEntry(targetPtr);
                 if (intPtr != IntPtr.Zero && intPtr != targetPtr && !MethodEntryResolver.IsJump(intPtr))
                 {
-                    _patchType = 3;
+                    _patchType = HookConstants.PatchTypeAbsolute;
                     _patchAddress = intPtr;
                     _originalBytes = Jumper.Install(intPtr, jumpTarget);
                     diag.PatchType = "ResolvedJitCode(5-byte) x86";

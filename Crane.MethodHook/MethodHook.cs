@@ -11,6 +11,14 @@ namespace Crane.MethodHook
 {
     public sealed partial class MethodHook : IDisposable
     {
+        /// <summary>
+        /// Lock object protecting StartHook/StopHook/Dispose from concurrent
+        /// execution on the same instance. Install/uninstall modify mutable
+        /// patch state (_slotAddresses, _originalBytes, trampoline pointers)
+        /// that must not be touched by two threads simultaneously.
+        /// </summary>
+        private readonly object _stateLock = new object();
+
         private readonly MethodBase _targetMethod;
 
         private readonly MethodBase _hookMethod;
@@ -104,6 +112,36 @@ namespace Crane.MethodHook
         private IntPtr _target2OriginalValue;
 
         /// <summary>
+        /// On .NET 8+, the precode's second FF 25 data cell points to the tier-1
+        /// JIT code address. Call sites that have been backpatched by tiered
+        /// compilation call this address DIRECTLY (not through the data cell),
+        /// bypassing the Target2Patch data cell patch. We must also patch the JIT
+        /// code at this address with a 12-byte absolute jump to the adapter.
+        /// </summary>
+        private bool _hasTarget2JitPatch;
+
+        private IntPtr _target2JitAddress;
+
+        private byte[] _target2JitOriginalBytes;
+
+        /// <summary>
+        /// The shared CLR FixupPrecode fixup helper address, read from the HOOK
+        /// method's precode target2 data cell during StartHook. In CoreCLR, every
+        /// FixupPrecode's second FF 25 target points to the SAME shared helper
+        /// (FixupPrecode::Fixup). Patching this shared address with a method-
+        /// specific absolute jump corrupts ALL precodes that dispatch through it.
+        ///
+        /// In .NET 8 Debug + tiered compilation ON (no debugger attached), the
+        /// hook method's own precode may not be tier-1 backpatched yet, so it
+        /// dispatches through this shared helper. If the helper is patched to
+        /// redirect to the hook's adapter, the dispatch loops forever:
+        ///   adapter → hook precode → shared helper (patched) → adapter → ...
+        /// This field is used to guard InstallTarget2Patch against patching the
+        /// shared helper.
+        /// </summary>
+        private IntPtr _sharedFixupHelperAddr;
+
+        /// <summary>
         /// On .NET Framework 4.x, generic instance methods have an E9 precode that
         /// jumps to a fixup thunk. The fixup thunk loads &lt;jit_addr&gt; into RAX
         /// and JMPs to it. The &lt;jit_addr&gt; may point to a PRESTUB or data
@@ -166,12 +204,26 @@ namespace Crane.MethodHook
         /// to restore it — observed on .NET 8+ for CoreLib methods), the hook
         /// is re-entered, causing infinite recursion. This flag detects such
         /// re-entrancy and throws instead of crashing with AccessViolationException.
+        ///
+        /// Marked volatile so the re-entrancy check is visible across threads
+        /// (e.g., when the hook is triggered on a GC/Finalizer thread while
+        /// InvokeOriginal is running on the main thread).
         /// </summary>
-        private bool _inCallOriginal;
+        private volatile bool _inCallOriginal;
+
+        /// <summary>
+        /// Re-entrancy counter for CallOriginal. Counts how many times
+        /// InvokeOriginal has been re-entered on the same hook instance.
+        /// If this exceeds <see cref="HookConstants.MaxReentrancyCount"/>, the
+        /// re-entrancy guard returns a default value instead of throwing,
+        /// breaking potential infinite loops caused by tier-0 delegate Invoke
+        /// retry stubs on .NET 8 Debug mode.
+        /// </summary>
+        private int _reentrancyCount;
 
         private bool _isInstalled;
 
-        private bool _isDisposed;
+        private volatile bool _isDisposed;
 
         public bool IsEnabled => _isInstalled;
 
@@ -198,20 +250,37 @@ namespace Crane.MethodHook
 
         public void StartHook()
         {
-            if (_isInstalled)
+            lock (_stateLock)
             {
-                return;
+                if (_isInstalled)
+                {
+                    return;
+                }
+                if (_isDisposed)
+                {
+                    throw new ObjectDisposedException("MethodHook");
+                }
+                StartHookCore();
             }
-            if (_isDisposed)
-            {
-                throw new ObjectDisposedException("MethodHook");
-            }
+        }
+
+        /// <summary>
+        /// Core hook installation logic. Caller must hold <see cref="_stateLock"/>.
+        /// </summary>
+        private void StartHookCore()
+        {
             HookDiagInfo hookDiagInfo = new HookDiagInfo();
             hookDiagInfo.TargetMethod = _targetMethod.ToString();
             hookDiagInfo.HookMethod = _hookMethod.ToString();
             // Assign DiagInfo early so it is available for debugging even if
             // StartHook throws before reaching the final assignment at the end.
             DiagInfo = hookDiagInfo;
+            // Set NoInlining on the target's MethodDesc to prevent the legacy
+            // JIT64 (.NET Framework 4.x) from inlining the target into callers.
+            // For value-type instance methods, this also calls PrepareMethod
+            // first to establish a stable JIT entry point — without it,
+            // NoInlining is silently ignored for constrained.callvirt.
+            TrySetNoInlining(_targetMethod);
             PrepareMethod(_targetMethod);
             PrepareMethod(_hookMethod);
             // Create a delegate to the original method BEFORE any patching.
@@ -219,16 +288,12 @@ namespace Crane.MethodHook
             // dictionary setup (R10), bypassing RuntimeMethodHandle.InvokeMethod
             // which crashes (0x80131506) for hooked generic methods.
             CreateOriginalDelegate();
-            // RuntimeHelpers.PrepareMethod may not fully JIT compile generic methods
-            // on .NET Framework 4.x — it can leave a PRESTUB that gets replaced on
-            // first actual call, overwriting our patch and causing crashes.
-            // Invoke the method once via the delegate's DynamicInvoke to force real
-            // JIT compilation AND backpatch the precode. DynamicInvoke calls the
-            // delegate's Invoke method, which calls the precode, which triggers the
-            // fixup thunk → JIT → backpatch. MethodInfo.Invoke on the target method
-            // uses RuntimeMethodHandle.InvokeMethod which bypasses the precode,
-            // leaving it un-backpatched and causing crashes when we patch the
-            // PRESTUB address extracted from the fixup thunk.
+            // Disable tiered compilation for the target method BEFORE JIT
+            // compilation. This prevents the CLR from promoting tier-0 JIT code
+            // to tier-1 at a different address, which would orphan our patches.
+            // This replaces the former approach of calling the method 50 times
+            // to force tier-1 promotion.
+            bool tieredDisabled = TryDisableTieredCompilation(_targetMethod);
             EnsureJitCompiled(_targetMethod);
             IntPtr functionPointer = _targetMethod.MethodHandle.GetFunctionPointer();
             IntPtr functionPointer2 = _hookMethod.MethodHandle.GetFunctionPointer();
@@ -281,8 +346,22 @@ namespace Crane.MethodHook
             _targetJitCode = targetJitCode;
             if (_needsGenericAdapter)
             {
-                intPtr = resolved;
-                if (intPtr == IntPtr.Zero || intPtr == targetJitCode) intPtr = functionPointer2;
+                // For generic methods, the adapter trampoline shifts registers
+                // (generic dictionary in RDX/RCX) before jumping to the hook.
+                //
+                // On .NET 8+ Release (tiered compilation on), ResolveRealEntry
+                // for the HOOK method's precode may resolve through shared CLR
+                // fixup helpers and end up at the TARGET method's JIT code address
+                // — not the hook's. Using that as the adapter jump target creates
+                // an infinite loop: adapter → target JIT (E9-patched) → adapter → ...
+                //
+                // The existing `intPtr == targetJitCode` check only compares against
+                // ResolveRealEntry(target precode), which may differ from the
+                // MethodDesc-scanned JIT address. To be safe, always use the hook's
+                // precode address (functionPointer2) for generic methods. The
+                // FixupPrecode's FF 25 does not touch parameter registers
+                // (RCX/RDX/R8/R9), so the adapter's register shuffle is preserved.
+                intPtr = functionPointer2;
             }
             else if (resolved != IntPtr.Zero && resolved != functionPointer2
                      && resolved != targetJitCode
@@ -304,6 +383,12 @@ namespace Crane.MethodHook
             hookDiagInfo.HookPrecodeAddr = functionPointer2;
             hookDiagInfo.HookPrecodeBytes = MemOps.ReadBytesSafe(functionPointer2, 32);
             hookDiagInfo.HookResolvedEntry = intPtr;
+            // Read the shared fixup helper address from the hook method's precode
+            // target2 data cell. In CoreCLR, every FixupPrecode's target2 points
+            // to the SAME shared helper. Patching it corrupts all precodes that
+            // dispatch through it (causing infinite loops in .NET 8 Debug + tiered
+            // mode where the hook's own precode is not yet tier-1 backpatched).
+            _sharedFixupHelperAddr = ReadFixupPrecodeTarget2(functionPointer2);
             if (NeedsGenericAdapter())
             {
                 // On x64, generic instance methods pass the generic dictionary in
@@ -314,20 +399,7 @@ namespace Crane.MethodHook
                 // Without this, the hook receives the generic dictionary as its
                 // first user argument and the real arguments are shifted by one.
                 byte[] adapterBytes = BuildGenericAdapterBytes(_targetMethod.IsStatic, _targetMethod.GetParameters().Length);
-                if (adapterBytes.Length > 0)
-                {
-                    int trampSize = adapterBytes.Length + 12; // adapter + MOV RAX,imm64; JMP RAX
-                    _hookAdapterTrampoline = Memory.AllocExecNear(intPtr, trampSize);
-                    if (_hookAdapterTrampoline != IntPtr.Zero && _hookAdapterTrampoline != new IntPtr(-1))
-                    {
-                        MemOps.WriteBytes(_hookAdapterTrampoline, adapterBytes);
-                        byte[] jumpBytes = Jumper.BuildAbsJumpX64(intPtr);
-                        MemOps.WriteBytes(_hookAdapterTrampoline + adapterBytes.Length, jumpBytes);
-                        hookDiagInfo.AdapterAddr = _hookAdapterTrampoline;
-                        hookDiagInfo.AdapterBytes = adapterBytes;
-                        intPtr = _hookAdapterTrampoline; // all patches now jump to adapter → hook
-                    }
-                }
+                intPtr = TryInstallAdapterTrampoline(intPtr, adapterBytes, hookDiagInfo);
             }
             if (NeedsValueTypeAdapter())
             {
@@ -337,17 +409,7 @@ namespace Crane.MethodHook
                 // the pointer (MOV RCX, [RCX]) before jumping to the hook, converting
                 // byref → byval. Only for structs ≤ 8 bytes (single register).
                 byte[] adapterBytes = BuildValueTypeAdapterBytes();
-                int trampSize = adapterBytes.Length + 12; // adapter + MOV RAX,imm64; JMP RAX
-                _hookAdapterTrampoline = Memory.AllocExecNear(intPtr, trampSize);
-                if (_hookAdapterTrampoline != IntPtr.Zero && _hookAdapterTrampoline != new IntPtr(-1))
-                {
-                    MemOps.WriteBytes(_hookAdapterTrampoline, adapterBytes);
-                    byte[] jumpBytes = Jumper.BuildAbsJumpX64(intPtr);
-                    MemOps.WriteBytes(_hookAdapterTrampoline + adapterBytes.Length, jumpBytes);
-                    hookDiagInfo.AdapterAddr = _hookAdapterTrampoline;
-                    hookDiagInfo.AdapterBytes = adapterBytes;
-                    intPtr = _hookAdapterTrampoline; // all patches now jump to adapter → hook
-                }
+                intPtr = TryInstallAdapterTrampoline(intPtr, adapterBytes, hookDiagInfo);
             }
             _newSlotValue = intPtr;
             hookDiagInfo.JumpTargetAddr = intPtr;
@@ -537,6 +599,192 @@ namespace Crane.MethodHook
         }
 
         /// <summary>
+        /// Clears the <c>IsEligibleForTieredCompilation</c> flag on the target
+        /// method's MethodDesc so the CLR will not promote its JIT code from
+        /// tier-0 to tier-1. This ensures patches applied to the current JIT
+        /// code address remain stable — the CLR won't compile new code at a
+        /// different address and orphan our secondary JIT patch.
+        ///
+        /// This is the preferred alternative to forcing tier-1 promotion by
+        /// calling the method many times (which is slow and has side effects).
+        /// By disabling tiered compilation for just this one method, the JIT
+        /// code address we patch at install time remains valid for the lifetime
+        /// of the hook.
+        ///
+        /// MethodDesc flag layout (RELEASE build, x64):
+        ///   .NET 6/7: m_bFlags2 at offset 3, bit 0x20
+        ///   .NET 8+ : m_wFlags3AndTokenRemainder at offset 0, bit 0x8000
+        ///
+        /// Returns true if the flag was found and cleared, false if the
+        /// runtime version is unsupported or the flag could not be verified.
+        /// </summary>
+        private bool TryDisableTieredCompilation(MethodBase method)
+        {
+            // Tiered compilation only exists on .NET Core 3.0+ / .NET 5+.
+            // .NET Framework 4.x has no tiered compilation — nothing to disable.
+            if (Environment.Version.Major < 6)
+                return false;
+
+            IntPtr md = method.MethodHandle.Value;
+            if (md == IntPtr.Zero) return false;
+            // MethodDesc is only 8 bytes in RELEASE layout, but we read a few
+            // extra bytes for the sanity-check verification below.
+            if (!Memory.IsReadable(md, 8)) return false;
+
+            try
+            {
+                if (Environment.Version.Major >= 8)
+                {
+                    // .NET 8+: flag is in m_wFlags3AndTokenRemainder at offset 0
+                    // Sanity check: HasStableEntryPoint or HasPrecode should be set
+                    // after RuntimeHelpers.PrepareMethod (called earlier in StartHook).
+                    ushort flags = (ushort)Marshal.ReadInt16(md, 0);
+                    if ((flags & HookConstants.Flag3StableMask) == 0)
+                    {
+                        // Neither HasStableEntryPoint nor HasPrecode is set —
+                        // likely a DEBUG runtime (extra fields shift the offset)
+                        // or an unexpected MethodDesc layout. Bail out safely.
+                        return false;
+                    }
+                    if ((flags & HookConstants.Flag3IsEligibleForTieredCompilation) == 0)
+                        return true; // Already not eligible — nothing to do.
+
+                    ushort cleared = (ushort)(flags & ~HookConstants.Flag3IsEligibleForTieredCompilation);
+                    Memory.ProtectReadWrite(md, 2);
+                    Marshal.WriteInt16(md, 0, (short)cleared);
+                    return true;
+                }
+                else
+                {
+                    // .NET 6/7: flag is in m_bFlags2 at offset 3
+                    // Sanity check: HasStableEntryPoint or HasPrecode should be set.
+                    byte flags = MemOps.ReadByte(md + 3);
+                    if ((flags & HookConstants.Flag2StableMask) == 0)
+                        return false;
+                    if ((flags & HookConstants.Flag2IsEligibleForTieredCompilation) == 0)
+                        return true; // Already not eligible.
+
+                    byte clearedByte = (byte)(flags & ~HookConstants.Flag2IsEligibleForTieredCompilation);
+                    Memory.ProtectReadWrite(md + 3, 1);
+                    Marshal.WriteByte(md + 3, clearedByte);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                DiagInfo?.AppendPatchError("TryDisableTieredCompilation", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Prepares a target method for hooking by setting the NoInlining flag
+        /// on its MethodDesc. This prevents the JIT from inlining the method
+        /// into callers, ensuring that direct calls go through the method's
+        /// precode/JIT code entry point (which the hook patches).
+        ///
+        /// CRITICAL: This MUST be called BEFORE the caller method is JIT-compiled.
+        /// On .NET Framework 4.x Release mode, the legacy JIT64 inlines small
+        /// method calls (including constrained.callvirt on value-type instance
+        /// methods such as DateTime.ToString / Int32.ToString) at caller
+        /// compilation time. If the caller is already compiled (e.g., the hook
+        /// is installed inside the caller), setting NoInlining afterwards has
+        /// no effect — the inlined call sites bypass the hook permanently.
+        ///
+        /// Typical usage: call PrepareForHooking from Main (or another method
+        /// that runs before the test/caller method is invoked) for each target
+        /// method you intend to hook.
+        ///
+        /// Note: On .NET 6+ (CoreCLR), this is a no-op — RyuJIT does not inline
+        /// the target methods, so the flag is not needed. On .NET Framework 4.x
+        /// (x64), this sets the internal NoInlining flag (bit 0x2000) at
+        /// MethodDesc offset 6 (m_wFlags). For value-type instance methods, it
+        /// also calls RuntimeHelpers.PrepareMethod first to establish a stable
+        /// JIT entry point — without this, NoInlining is silently ignored for
+        /// constrained.callvirt by the legacy JIT64 inliner.
+        ///
+        /// Returns true if the flag was set (or was already set). Returns false
+        /// if the runtime is unsupported or the MethodDesc could not be modified.
+        /// </summary>
+        public static bool PrepareForHooking(MethodBase method)
+        {
+            if (method == null) return false;
+            return TrySetNoInlining(method);
+        }
+
+        /// <summary>
+        /// Sets the NoInlining flag on the method's MethodDesc so the JIT does
+        /// not inline it into callers. Must be called BEFORE the caller is
+        /// JIT-compiled. On .NET 6+ this is a no-op (RyuJIT does not inline
+        /// these methods). Only .NET Framework 4.x (x64) is supported.
+        /// </summary>
+        private static bool TrySetNoInlining(MethodBase method)
+        {
+            // NoInlining flag manipulation is only needed on .NET Framework 4.x,
+            // where the legacy JIT64 inlines small method calls at caller
+            // compilation time. On .NET 6+ (CoreCLR), RyuJIT does not inline
+            // these methods, so PrepareForHooking is a no-op there.
+            if (Environment.Version.Major >= 6)
+                return false;
+
+            IntPtr md = method.MethodHandle.Value;
+            if (md == IntPtr.Zero) return false;
+            if (!Memory.IsReadable(md, 8)) return false;
+
+            try
+            {
+                // .NET Framework 4.x (CLR 4.0) x64 MethodDesc layout:
+                //   offset 6: m_wFlags (2 bytes) — MethodImplAttributes + internal flags
+                //
+                // NoInlining corresponds to bit 0x2000 in m_wFlags (verified
+                // empirically via probe methods marked with [MethodImpl(NoInlining)]).
+                // The managed MethodImplAttributes.NoInlining (0x0008) is NOT the
+                // bit the JIT64 inliner checks — writing 0x0008 corrupts internal
+                // state and crashes (0xC0000005).
+                //
+                // For value-type instance methods (e.g. DateTime.ToString,
+                // Int32.ToString), the legacy JIT64 inlines constrained.callvirt
+                // calls. Setting NoInlining (0x2000) alone is NOT enough for these
+                // methods — they also need a stable JIT entry point (HasStableEntryPoint
+                // 0x0008 in m_wFlags, set by the CLR after PrepareMethod). Without
+                // PrepareMethod, NoInlining is silently ignored for constrained.callvirt.
+                // We call RuntimeHelpers.PrepareMethod first to force JIT
+                // compilation and establish the stable entry point, THEN set
+                // NoInlining. This combination successfully prevents
+                // constrained.callvirt inlining on .NET Framework 4.x x64.
+                ushort flags = (ushort)Marshal.ReadInt16(md, HookConstants.MethodDescFlagsOffset);
+
+                // For value-type instance methods, force JIT compilation first.
+                // BCL value-type methods (DateTime.ToString, Int32.ToString) lack
+                // the HasStableEntryPoint flag until PrepareMethod is called.
+                // Without it, NoInlining is ignored for constrained.callvirt.
+                bool isValueTypeInstance = method.DeclaringType != null &&
+                    method.DeclaringType.IsValueType && !method.IsStatic;
+                if (isValueTypeInstance && (flags & HookConstants.HasStableEntryPointFlag) == 0)
+                {
+                    try
+                    {
+                        RuntimeHelpers.PrepareMethod(method.MethodHandle);
+                    }
+                    catch { }
+                    flags = (ushort)Marshal.ReadInt16(md, HookConstants.MethodDescFlagsOffset);
+                }
+
+                if ((flags & HookConstants.NoInliningFlag) != 0)
+                    return true; // Already set
+
+                ushort newFlags = (ushort)(flags | HookConstants.NoInliningFlag);
+                Memory.ProtectReadWrite(md + HookConstants.MethodDescFlagsOffset, 2);
+                Marshal.WriteInt16(md, HookConstants.MethodDescFlagsOffset, (short)newFlags);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Forces real JIT compilation of the target method AND backpatches the
         /// precode by invoking the method once with dummy arguments.
         ///
@@ -676,36 +924,13 @@ namespace Crane.MethodHook
                     mi.Invoke(instance, methodArgs);
                 }
 
-                // On .NET 8+, force tiered compilation promotion by calling the
-                // method many times. Tiered promotion can invalidate patches
-                // applied to tier-0 JIT code — the CLR compiles new tier-1 code
-                // at a different address and updates the precode's data cell,
-                // orphaning our secondary JIT patch. Call sites that bypass the
-                // precode (calling JIT code directly) then miss the hook entirely.
-                // By forcing promotion BEFORE patching, we ensure ResolveRealEntry
-                // returns the stable tier-1 JIT code address, and our patches are
-                // applied to code that will not be promoted again.
-                if (Environment.Version.Major >= 8 && !mi.IsGenericMethod)
-                {
-                    for (int i = 0; i < 50; i++)
-                    {
-                        try
-                        {
-                            if (_originalDelegate != null)
-                                _originalDelegate.DynamicInvoke(invokeArgs);
-                            else
-                                mi.Invoke(instance, methodArgs);
-                        }
-                        catch
-                        {
-                            // Expected — dummy args may throw, but the call
-                            // counter for tiered promotion increments regardless.
-                        }
-                    }
-                    // Wait briefly for the background tier-1 JIT thread to
-                    // complete compilation and update the precode's data cell.
-                    System.Threading.Thread.Sleep(50);
-                }
+                // On .NET 8+, tiered compilation promotion is handled by
+                // TryDisableTieredCompilation (called earlier in StartHook),
+                // which clears the IsEligibleForTieredCompilation flag on the
+                // MethodDesc. This prevents the CLR from promoting tier-0 JIT
+                // code to tier-1 at a different address, so the single
+                // DynamicInvoke above is sufficient — no need for 50 calls
+                // or address-stabilization polling.
             }
             catch
             {
@@ -836,20 +1061,35 @@ namespace Crane.MethodHook
                 }
                 _delegateInvokeFptr = invokeHandle.GetFunctionPointer();
             }
-            catch (Exception)
+            catch (Exception ex)
             {
                 _originalDelegate = null;
                 _delegateInvokeFptr = IntPtr.Zero;
                 _delegateFlatArgCount = 0;
+                if (DiagInfo != null)
+                {
+                    DiagInfo.PatchError += "; CreateOriginalDelegate failed: " + ex.Message;
+                }
             }
         }
 
         public void StopHook()
         {
-            if (!_isInstalled)
+            lock (_stateLock)
             {
-                return;
+                if (!_isInstalled)
+                {
+                    return;
+                }
+                StopHookCore();
             }
+        }
+
+        /// <summary>
+        /// Core hook removal logic. Caller must hold <see cref="_stateLock"/>.
+        /// </summary>
+        private void StopHookCore()
+        {
             // RestoreAll FIRST, before any diagnostic logging.
             RestoreAll();
             if (_nearTrampoline != IntPtr.Zero)
@@ -870,19 +1110,6 @@ namespace Crane.MethodHook
             _isInstalled = false;
         }
 
-        private static string ByteHex(byte[] b)
-        {
-            if (b == null) return "null";
-            var sb = new System.Text.StringBuilder(b.Length * 3);
-            for (int i = 0; i < b.Length; i++) { if (i > 0) sb.Append(' '); sb.Append(b[i].ToString("X2")); }
-            return sb.ToString();
-        }
-        private static IntPtr ReadIntPtrCellSafe(IntPtr addr)
-        {
-            if (addr == IntPtr.Zero) return IntPtr.Zero;
-            try { return Marshal.ReadIntPtr(addr); } catch { return IntPtr.Zero; }
-        }
-
         private void SafeTry(string description, Action action)
         {
             try
@@ -898,8 +1125,39 @@ namespace Crane.MethodHook
             }
         }
 
+        /// <summary>
+        /// Allocates an adapter trampoline near <paramref name="hookEntry"/> that
+        /// executes <paramref name="adapterBytes"/> (register shuffle / dereference)
+        /// then jumps to <paramref name="hookEntry"/>. On success, updates
+        /// <see cref="_hookAdapterTrampoline"/> and diagnostic fields, and returns
+        /// the trampoline address (subsequent patches jump to adapter → hook).
+        /// On failure, returns <paramref name="hookEntry"/> unchanged.
+        /// </summary>
+        private IntPtr TryInstallAdapterTrampoline(IntPtr hookEntry, byte[] adapterBytes, HookDiagInfo diag)
+        {
+            if (adapterBytes == null || adapterBytes.Length == 0)
+                return hookEntry;
+            int trampSize = adapterBytes.Length + 12; // adapter + MOV RAX,imm64; JMP RAX
+            IntPtr trampoline = Memory.AllocExecNear(hookEntry, trampSize);
+            if (trampoline == IntPtr.Zero || trampoline == new IntPtr(-1))
+                return hookEntry;
+            MemOps.WriteBytes(trampoline, adapterBytes);
+            byte[] jumpBytes = Jumper.BuildAbsJumpX64(hookEntry);
+            MemOps.WriteBytes(trampoline + adapterBytes.Length, jumpBytes);
+            _hookAdapterTrampoline = trampoline;
+            diag.AdapterAddr = trampoline;
+            diag.AdapterBytes = adapterBytes;
+            return trampoline; // all patches now jump to adapter → hook
+        }
+
         private void RestoreAll()
         {
+            // Phase 1: Restore code patches FIRST (see RestoreCodePatch comment).
+            RestoreCodePatch();
+            // Phase 2: Restore slot data cells.
+            // Slots are MethodTable entries (data cells) that may point to precode
+            // or JIT code. They must be restored AFTER code patches so that calls
+            // through restored slots reach unpatched code.
             if (_slotAddresses != null)
             {
                 // Use per-slot original values when available: SlotPatcher may find
@@ -918,59 +1176,81 @@ namespace Crane.MethodHook
                     SafeTry("RestoreSlot " + capturedSlot, () => SlotPatcher.ReplaceSlot(capturedSlot, captured));
                 }
             }
-            RestoreCodePatch();
         }
 
         private void RestoreCodePatch()
         {
-            switch (_patchType)
+            // Phase 1: Restore ALL code patches FIRST.
+            // Code patches (Jumper.Restore) write original bytes to executable code
+            // addresses. They must be restored before any data cell that points to
+            // them is restored. Otherwise, a call through the restored data cell
+            // hits still-patched code → adapter → hook → InvokeOriginal re-entrancy.
+            //
+            // CRITICAL: No file I/O or string allocation is allowed in this method.
+            // On .NET 8 Debug mode with tiered compilation disabled, any allocation
+            // can trigger GC or JIT compilation that calls through still-patched
+            // code paths (target1/innerCode/target2Jit), causing re-entrancy.
+            if (_patchType == HookConstants.PatchTypeInstruction || _patchType == HookConstants.PatchTypeAbsolute)
             {
-                case 1:
-                    if (_indirectTargetLoc == IntPtr.Zero)
-                    {
-                        break;
-                    }
-                    SafeTry("Restore indirectTargetLoc", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _originalIndirectTarget));
-                    break;
-                case 2:
-                case 3:
-                    if (_patchAddress != IntPtr.Zero && _originalBytes != null)
-                    {
-                        SafeTry("Restore patchAddress", () => Jumper.Restore(_patchAddress, _originalBytes));
-                    }
-                    break;
+                RestoreCodeBytes("patchAddress", _patchAddress, _originalBytes);
             }
-            // Restore the indirect data cell independently when _hasIndirectPatch
-            // is set (used with _patchType=2 E9 instruction patch on FF 25 precode).
-            // This is NOT needed for _patchType=1 (case 1 already handles it).
-            if (_hasIndirectPatch && _patchType != 1 && _indirectTargetLoc != IntPtr.Zero)
+            RestoreCodeBytes("secondaryJit", _hasSecondaryPatch, _secondaryJitAddress, _secondaryJitOriginalBytes);
+            RestoreCodeBytes("target1", _hasTarget1Patch, _target1Address, _target1OriginalBytes);
+            RestoreCodeBytes("innerCode", _hasInnerCodePatch, _innerCodeAddress, _innerCodeOriginalBytes);
+            RestoreCodeBytes("target2Jit", _hasTarget2JitPatch, _target2JitAddress, _target2JitOriginalBytes);
+
+            // Phase 2: Restore ALL data cell patches.
+            // Now that all code patches are restored, data cells can safely point
+            // to their original code addresses without triggering re-entrancy.
+            if (_patchType == HookConstants.PatchTypeIndirect)
             {
-                SafeTry("Restore indirectTargetLoc (hasIndirect)", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _originalIndirectTarget));
+                RestoreDataCell("indirectTargetLoc", _indirectTargetLoc, _originalIndirectTarget);
             }
-            if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero && _secondaryJitOriginalBytes != null)
+            if (_hasIndirectPatch && _patchType != HookConstants.PatchTypeIndirect)
             {
-                SafeTry("Restore secondaryJit", () => Jumper.Restore(_secondaryJitAddress, _secondaryJitOriginalBytes));
+                RestoreDataCell("indirectTargetLoc(hasIndirect)", _indirectTargetLoc, _originalIndirectTarget);
             }
-            if (_hasTarget1Patch && _target1Address != IntPtr.Zero && _target1OriginalBytes != null)
-            {
-                SafeTry("Restore target1", () => Jumper.Restore(_target1Address, _target1OriginalBytes));
-            }
-            if (_hasInnerCodePatch && _innerCodeAddress != IntPtr.Zero && _innerCodeOriginalBytes != null)
-            {
-                SafeTry("Restore innerCode", () => Jumper.Restore(_innerCodeAddress, _innerCodeOriginalBytes));
-            }
-            if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
-            {
-                SafeTry("Restore target2", () => MemOps.WriteIntPtrCell(_target2Loc, _target2OriginalValue));
-            }
-            if (_hasFixupJitAddrPatch && _fixupJitAddrLoc != IntPtr.Zero)
-            {
-                SafeTry("Restore fixupJitAddr", () => MemOps.WriteIntPtrCell(_fixupJitAddrLoc, _fixupJitAddrOriginal));
-            }
+            RestoreDataCell("target2", _hasTarget2Patch, _target2Loc, _target2OriginalValue);
+            RestoreDataCell("fixupJitAddr", _hasFixupJitAddrPatch, _fixupJitAddrLoc, _fixupJitAddrOriginal);
+        }
+
+        /// <summary>
+        /// Restores original bytes at a code patch address. No-op if the patch
+        /// was not installed or the address/bytes are invalid.
+        /// </summary>
+        private void RestoreCodeBytes(string name, bool hasPatch, IntPtr addr, byte[] original)
+        {
+            if (!hasPatch) return;
+            RestoreCodeBytes(name, addr, original);
+        }
+
+        private void RestoreCodeBytes(string name, IntPtr addr, byte[] original)
+        {
+            if (addr == IntPtr.Zero || original == null) return;
+            SafeTry("Restore " + name, () => Jumper.Restore(addr, original));
+        }
+
+        /// <summary>
+        /// Restores an 8-byte data cell to its original pointer value.
+        /// No-op if the patch was not installed or the address is invalid.
+        /// </summary>
+        private void RestoreDataCell(string name, bool hasPatch, IntPtr loc, IntPtr original)
+        {
+            if (!hasPatch) return;
+            RestoreDataCell(name, loc, original);
+        }
+
+        private void RestoreDataCell(string name, IntPtr loc, IntPtr original)
+        {
+            if (loc == IntPtr.Zero) return;
+            SafeTry("Restore " + name, () => MemOps.WriteIntPtrCell(loc, original));
         }
 
         private void ReapplyAll()
         {
+            // Phase 1: Re-apply code patches FIRST (symmetric with RestoreAll).
+            ReapplyCodePatch();
+            // Phase 2: Re-apply slot data cells.
             if (_slotAddresses != null)
             {
                 foreach (IntPtr slotAddress in _slotAddresses)
@@ -978,43 +1258,33 @@ namespace Crane.MethodHook
                     SafeTry("ReapplySlot " + slotAddress, () => SlotPatcher.ReplaceSlot(slotAddress, _newSlotValue));
                 }
             }
-            ReapplyCodePatch();
         }
 
         private void ReapplyCodePatch()
         {
-            switch (_patchType)
+            // Phase 1: Re-apply ALL code patches FIRST.
+            // Symmetric with RestoreCodePatch: code patches are re-applied before
+            // data cell patches. This ensures that when a data cell is patched to
+            // point to the adapter, the code at the data cell's original target is
+            // already patched too — closing the window where direct calls to JIT
+            // code could bypass the hook.
+            if (_patchType == HookConstants.PatchTypeInstruction)
             {
-                case 1:
-                    if (_indirectTargetLoc == IntPtr.Zero)
+                if (_patchAddress != IntPtr.Zero && _nearTrampoline != IntPtr.Zero)
+                {
+                    SafeTry("Reapply patchAddress case2", () =>
                     {
-                        break;
-                    }
-                    SafeTry("Reapply indirectTargetLoc", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _newSlotValue));
-                    break;
-                case 2:
-                    if (_patchAddress != IntPtr.Zero && _nearTrampoline != IntPtr.Zero)
-                    {
-                        SafeTry("Reapply patchAddress case2", () =>
-                        {
-                            byte[] array = Jumper.BuildRelJump(_patchAddress, _nearTrampoline);
-                            MemOps.WriteBytesProtected(_patchAddress, array);
-                        });
-                    }
-                    break;
-                case 3:
-                    if (_patchAddress != IntPtr.Zero)
-                    {
-                        SafeTry("Reapply patchAddress case3", () => Jumper.WriteJump(_patchAddress, _newSlotValue));
-                    }
-                    break;
+                        byte[] array = Jumper.BuildRelJump(_patchAddress, _nearTrampoline);
+                        MemOps.WriteBytesProtected(_patchAddress, array);
+                    });
+                }
             }
-            // Reapply the indirect data cell independently when _hasIndirectPatch
-            // is set (used with _patchType=2 E9 instruction patch on FF 25 precode).
-            // This is NOT needed for _patchType=1 (case 1 already handles it).
-            if (_hasIndirectPatch && _patchType != 1 && _indirectTargetLoc != IntPtr.Zero)
+            else if (_patchType == HookConstants.PatchTypeAbsolute)
             {
-                SafeTry("Reapply indirectTargetLoc (hasIndirect)", () => MemOps.WriteIntPtrCell(_indirectTargetLoc, _newSlotValue));
+                if (_patchAddress != IntPtr.Zero)
+                {
+                    SafeTry("Reapply patchAddress case3", () => Jumper.WriteJump(_patchAddress, _newSlotValue));
+                }
             }
             if (_hasSecondaryPatch && _secondaryJitAddress != IntPtr.Zero)
             {
@@ -1027,38 +1297,94 @@ namespace Crane.MethodHook
                     MemOps.WriteBytesProtected(_secondaryJitAddress, patch);
                 });
             }
-            if (_hasTarget1Patch && _target1Address != IntPtr.Zero)
+            // target1, innerCode, and target2Jit all use a 12-byte absolute
+            // jump to _newSlotValue. Use the shared helper to reduce duplication.
+            ReapplyAbsJumpPatch("target1", _hasTarget1Patch, _target1Address);
+            ReapplyAbsJumpPatch("innerCode", _hasInnerCodePatch, _innerCodeAddress);
+            ReapplyAbsJumpPatch("target2Jit", _hasTarget2JitPatch, _target2JitAddress);
+
+            // Phase 2: Re-apply ALL data cell patches.
+            if (_patchType == HookConstants.PatchTypeIndirect)
             {
-                SafeTry("Reapply target1", () =>
-                {
-                    byte[] patch = Jumper.BuildAbsJumpX64(_newSlotValue);
-                    MemOps.WriteBytesProtected(_target1Address, patch);
-                });
+                ReapplyDataCell("indirectTargetLoc", _indirectTargetLoc);
             }
-            if (_hasInnerCodePatch && _innerCodeAddress != IntPtr.Zero)
+            if (_hasIndirectPatch && _patchType != HookConstants.PatchTypeIndirect)
             {
-                SafeTry("Reapply innerCode", () =>
-                {
-                    byte[] patch = Jumper.BuildAbsJumpX64(_newSlotValue);
-                    MemOps.WriteBytesProtected(_innerCodeAddress, patch);
-                });
+                ReapplyDataCell("indirectTargetLoc(hasIndirect)", _indirectTargetLoc);
             }
-            if (_hasTarget2Patch && _target2Loc != IntPtr.Zero)
-            {
-                SafeTry("Reapply target2", () => MemOps.WriteIntPtrCell(_target2Loc, _newSlotValue));
-            }
-            if (_hasFixupJitAddrPatch && _fixupJitAddrLoc != IntPtr.Zero)
-            {
-                SafeTry("Reapply fixupJitAddr", () => MemOps.WriteIntPtrCell(_fixupJitAddrLoc, _newSlotValue));
-            }
+            ReapplyDataCell("target2", _hasTarget2Patch, _target2Loc);
+            ReapplyDataCell("fixupJitAddr", _hasFixupJitAddrPatch, _fixupJitAddrLoc);
         }
 
+        /// <summary>
+        /// Re-applies a 12-byte absolute jump patch (MOV RAX, hook; JMP RAX)
+        /// at the given code address. No-op if the patch was not installed or
+        /// the address is invalid.
+        /// </summary>
+        private void ReapplyAbsJumpPatch(string name, bool hasPatch, IntPtr addr)
+        {
+            if (!hasPatch || addr == IntPtr.Zero) return;
+            SafeTry("Reapply " + name, () =>
+            {
+                byte[] patch = Jumper.BuildAbsJumpX64(_newSlotValue);
+                MemOps.WriteBytesProtected(addr, patch);
+            });
+        }
+
+        /// <summary>
+        /// Re-applies a data cell patch (overwrites the 8-byte cell with the
+        /// hook's jump target). No-op if the patch was not installed or the
+        /// address is invalid.
+        /// </summary>
+        private void ReapplyDataCell(string name, bool hasPatch, IntPtr loc)
+        {
+            if (!hasPatch || loc == IntPtr.Zero) return;
+            SafeTry("Reapply " + name, () => MemOps.WriteIntPtrCell(loc, _newSlotValue));
+        }
+
+        private void ReapplyDataCell(string name, IntPtr loc)
+        {
+            if (loc == IntPtr.Zero) return;
+            SafeTry("Reapply " + name, () => MemOps.WriteIntPtrCell(loc, _newSlotValue));
+        }
+
+        /// <summary>
+        /// Releases all resources used by this hook. Safe to call multiple times.
+        /// Restores original code and frees trampoline allocations.
+        /// </summary>
+        /// <remarks>
+        /// This class does not have a finalizer because unhooking from a finalizer
+        /// thread is unsafe (the CLR may have already cleaned up method handles).
+        /// Users must call <see cref="Dispose"/> explicitly or use
+        /// <see cref="MethodHookManager.RemoveAllHook"/> before application shutdown.
+        /// </remarks>
         public void Dispose()
         {
-            if (!_isDisposed)
+            lock (_stateLock)
             {
-                StopHook();
-                _isDisposed = true;
+                if (_isDisposed)
+                {
+                    return;
+                }
+                try
+                {
+                    StopHookCore();
+                }
+                catch (Exception ex)
+                {
+                    if (DiagInfo != null)
+                    {
+                        DiagInfo.PatchError += "; Dispose StopHook failed: " + ex.Message;
+                    }
+                }
+                finally
+                {
+                    _isDisposed = true;
+                    // Suppress finalization to avoid redundant GC overhead. Even
+                    // though there's no finalizer, this is the standard pattern
+                    // and signals to the GC that the object is cleaned up.
+                    GC.SuppressFinalize(this);
+                }
             }
         }
 

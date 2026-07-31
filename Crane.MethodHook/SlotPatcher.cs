@@ -7,7 +7,7 @@ namespace Crane.MethodHook
     {
         public static List<IntPtr> FindSlots(IntPtr methodDesc, IntPtr methodTable, IntPtr value)
         {
-            return FindSlots(methodDesc, methodTable, value, 128);
+            return FindSlots(methodDesc, methodTable, value, HookConstants.MethodDescScanSize);
         }
 
         public static List<IntPtr> FindSlots(IntPtr methodDesc, IntPtr methodTable, IntPtr value, int methodDescScanSize)
@@ -41,16 +41,16 @@ namespace Crane.MethodHook
             if (methodTable != IntPtr.Zero)
             {
                 int consecutiveUnreadable = 0;
-                for (int j = 0; j < 65536; j += size)
+                for (int j = 0; j < HookConstants.MethodTableScanSize; j += size)
                 {
                     if (!Memory.IsReadable(methodTable + j, size))
                     {
                         // Skip unreadable regions instead of breaking. The MethodTable
                         // may span non-contiguous pages (e.g. on x86 where the vtable
-                        // extends past a page boundary). Allow up to 4096 bytes of
-                        // consecutive unreadable memory before giving up.
+                        // extends past a page boundary). Allow up to MaxConsecutiveUnreadable
+                        // bytes of consecutive unreadable memory before giving up.
                         consecutiveUnreadable += size;
-                        if (consecutiveUnreadable >= 4096)
+                        if (consecutiveUnreadable >= HookConstants.MaxConsecutiveUnreadable)
                             break;
                         continue;
                     }

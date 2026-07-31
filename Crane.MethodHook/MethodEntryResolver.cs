@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Crane.MethodHook
 {
@@ -40,6 +41,52 @@ namespace Crane.MethodHook
                 intPtr = intPtr2;
             }
             return intPtr;
+        }
+
+        /// <summary>
+        /// Returns ALL intermediate addresses in the resolution chain starting
+        /// from <paramref name="ptr"/>. For a generic method precode on .NET 8,
+        /// the chain is typically:
+        ///   precode (FF 25) → fixup thunk (48 B8 ... FF E0) → stub (E9) → JIT code
+        /// The generic dictionary slot may hold ANY of these addresses (not just
+        /// the first or last), so callers must search for all of them.
+        /// </summary>
+        public static List<IntPtr> ResolveChain(IntPtr ptr)
+        {
+            var chain = new List<IntPtr>();
+            if (ptr == IntPtr.Zero) return chain;
+            Platform.Arch current = Platform.Current;
+            IntPtr intPtr = ptr;
+            chain.Add(intPtr);
+            for (int i = 0; i < 10; i++)
+            {
+                IntPtr intPtr2;
+                try
+                {
+                    switch (current)
+                    {
+                        case Platform.Arch.X64:
+                            intPtr2 = ResolveOneX64(intPtr);
+                            break;
+                        case Platform.Arch.X86:
+                            intPtr2 = ResolveOneX86(intPtr);
+                            break;
+                        default:
+                            return chain;
+                    }
+                }
+                catch
+                {
+                    return chain;
+                }
+                if (intPtr2 == intPtr || intPtr2 == IntPtr.Zero)
+                {
+                    return chain;
+                }
+                chain.Add(intPtr2);
+                intPtr = intPtr2;
+            }
+            return chain;
         }
 
         public static bool IsJump(IntPtr ptr)

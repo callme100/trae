@@ -7,7 +7,7 @@ namespace Crane.MethodHook
     {
         private static readonly IntPtr CurrentProcess = new IntPtr(-1);
 
-        private static int PageSize => 4096;
+        private static int PageSize => HookConstants.PageSize;
 
         // Windows page protection constants (VirtualProtect dwNewProtect).
         // VirtualProtect REPLACES the page protection (it is not an OR), so the
@@ -159,14 +159,13 @@ namespace Crane.MethodHook
 
         public static IntPtr AllocExecNear(IntPtr nearAddr, int size)
         {
-            const long MaxRel32Range = 2147418112;
             long near = nearAddr.ToInt64();
-            UIntPtr sizeAligned = (UIntPtr)(ulong)((size + 4095) & -4096);
+            UIntPtr sizeAligned = (UIntPtr)(ulong)((size + HookConstants.PageSize - 1) & -HookConstants.PageSize);
             bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
-            long minAddr = near - MaxRel32Range;
-            long maxAddr = near + MaxRel32Range;
-            long step = isWindows ? 65536 : 4096;
+            long minAddr = near - HookConstants.MaxRel32Range;
+            long maxAddr = near + HookConstants.MaxRel32Range;
+            long step = isWindows ? 65536 : HookConstants.PageSize;
 
             if (isWindows)
             {
@@ -177,7 +176,7 @@ namespace Crane.MethodHook
                 if (minAddr < 0) minAddr = 65536;
             }
 
-            for (long offset = 0; offset < MaxRel32Range; offset += step)
+            for (long offset = 0; offset < HookConstants.MaxRel32Range; offset += step)
             {
                 // Forward: near + offset
                 long fwd = near + offset;
