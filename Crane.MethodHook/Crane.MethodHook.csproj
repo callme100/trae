@@ -23,7 +23,9 @@
   </ItemGroup> 
 
 
-  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+  <!-- Eazfuscator.NET obfuscation is Windows-only (Windows CMD syntax + native tool).
+       Skip on Linux/macOS to keep the build cross-platform. -->
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent" Condition="'$(OS)' == 'Windows_NT' And '$(ConfigurationName)' == 'Release'">
     <Exec Command="if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; set pdbFile=$(TargetPath)&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; set pdbFile=%25pdbFile:dll=pdb%25&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; copy &quot;%25pdbFile%25&quot; &quot;%25pdbFile%25_bak&quot;&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; Eazfuscator.NET.exe &quot;$(TargetPath)&quot; -v top&#xD;&#xA;if &quot;$(ConfigurationName)&quot;==&quot;Release&quot; move /y &quot;%25pdbFile%25_bak&quot; &quot;%25pdbFile%25&quot;" />
   </Target>
 

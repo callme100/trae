@@ -12,7 +12,27 @@ namespace Crane.MethodHook.Test
             Console.WriteLine("========================================");
             Console.WriteLine();
 
-            InstallHook();
+            try
+            {
+                InstallHook();
+            }
+            catch
+            {
+                throw;
+            }
+
+            // Print any hook installation errors for debugging
+            var errors = MethodHookManager.Instance.LastErrors;
+            if (errors != null && errors.Count > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[安装阶段] {errors.Count} 个 hook 安装错误:");
+                foreach (var ex in errors)
+                {
+                    Console.WriteLine($"  - {ex.Message}");
+                }
+                Console.ResetColor();
+            }
 
             Console.WriteLine("[安装阶段] Hook 安装完成，开始执行测试...");
             Console.WriteLine();
@@ -50,12 +70,12 @@ namespace Crane.MethodHook.Test
             targetMethod = typeof(Program).GetMethod(nameof(HookInt32ToString), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
 
-            //AssemblyName.Name        
+            //AssemblyName.Name
             sourceMethod = typeof(AssemblyName).GetProperty("Name").GetMethod;
             targetMethod = typeof(Program).GetMethod(nameof(HookAssemblyNameGetName), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
 
-            //StringBuilderSetCapacity       
+            //StringBuilderSetCapacity
             sourceMethod = typeof(System.Text.StringBuilder).GetProperty("Capacity").SetMethod;
             targetMethod = typeof(Program).GetMethod(nameof(HookStringBuilderSetCapacity), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
@@ -70,12 +90,12 @@ namespace Crane.MethodHook.Test
             targetMethod = typeof(Program).GetMethod(nameof(HookDateTimeGreaterThan), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
 
-            //string.Compare        
+            //string.Compare
             sourceMethod = typeof(string).GetMethod("Compare", allBindings, null, new[] { typeof(string), typeof(string) }, null);
             targetMethod = typeof(Program).GetMethod(nameof(HookStringCompare), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
 
-            //StreamReader.ReadToEnd      
+            //StreamReader.ReadToEnd
             sourceMethod = typeof(StreamReader).GetMethod("ReadToEnd", allBindings);
             targetMethod = typeof(Program).GetMethod(nameof(HookReadToEnd), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
@@ -85,7 +105,7 @@ namespace Crane.MethodHook.Test
             targetMethod = typeof(Program).GetMethod(nameof(HookConvertAll), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));
 
-            //MemoryStream.Write     
+            //MemoryStream.Write
             sourceMethod = typeof(MemoryStream).GetMethod("Write", allBindings, null, new[] { typeof(byte[]), typeof(int), typeof(int) }, null);
             targetMethod = typeof(Program).GetMethod(nameof(HookMemoryStreamWrite), allBindings);
             MethodHookManager.Instance.AddHook(new MethodHook(sourceMethod, targetMethod));

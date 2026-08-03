@@ -131,19 +131,34 @@ namespace Crane.MethodHook
         /// Tries to allocate executable memory at a specific address. If the allocation
         /// succeeds but falls outside the rel32 range of <paramref name="nearAddr"/>,
         /// the allocation is freed and IntPtr.Zero is returned.
+        ///
+        /// CRITICAL: On non-Windows (Linux/macOS), <paramref name="addr"/> MUST point
+        /// to a genuinely FREE address. Using mmap with MAP_FIXED at an already-mapped
+        /// address SILENTLY OVERWRITES the existing mapping — corrupting JIT code,
+        /// MethodTable, or precode memory and causing SIGSEGV. Callers must verify
+        /// the address is free (e.g. via /proc/self/maps on Linux) before calling
+        /// this method with <paramref name="useFixed"/> = true. When
+        /// <paramref name="useFixed"/> is false, mmap is called WITHOUT MAP_FIXED so
+        /// the address is only a hint (the kernel will never overwrite an existing
+        /// mapping); the result is checked against the rel32 range and returned if in
+        /// range, otherwise freed.
         /// </summary>
-        private static IntPtr TryAllocNearAt(IntPtr addr, UIntPtr sizeAligned, IntPtr nearAddr, bool isWindows)
+        private static IntPtr TryAllocNearAt(IntPtr addr, UIntPtr sizeAligned, IntPtr nearAddr, bool isWindows, bool useFixed)
         {
             IntPtr ptr;
             if (isWindows)
             {
+                // VirtualAlloc with a non-zero address returns NULL if the region
+                // is already in use — it never overwrites an existing mapping.
                 ptr = VirtualAlloc(addr, sizeAligned, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
                 if (ptr == IntPtr.Zero) return IntPtr.Zero;
             }
             else
             {
+                int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+                if (useFixed) flags |= MAP_FIXED;
                 ptr = mmap(addr, sizeAligned, PROT_READ | PROT_WRITE | PROT_EXEC,
-                    MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0L);
+                    flags, -1, 0L);
                 if (ptr.ToInt64() == -1 || ptr == IntPtr.Zero) return IntPtr.Zero;
             }
 
@@ -165,43 +180,197 @@ namespace Crane.MethodHook
 
             long minAddr = near - HookConstants.MaxRel32Range;
             long maxAddr = near + HookConstants.MaxRel32Range;
-            long step = isWindows ? 65536 : HookConstants.PageSize;
 
             if (isWindows)
             {
                 if (minAddr < 65536) minAddr = 65536;
-            }
-            else
-            {
-                if (minAddr < 0) minAddr = 65536;
+                long step = 65536;
+                for (long offset = 0; offset < HookConstants.MaxRel32Range; offset += step)
+                {
+                    // Forward: near + offset
+                    long fwd = near + offset;
+                    if (fwd >= minAddr && fwd + (long)sizeAligned.ToUInt64() <= maxAddr)
+                    {
+                        IntPtr r = TryAllocNearAt(new IntPtr(fwd), sizeAligned, nearAddr, true, true);
+                        if (r != IntPtr.Zero) return r;
+                    }
+                    // Backward: near - offset
+                    if (offset > 0)
+                    {
+                        long bwd = near - offset;
+                        if (bwd >= minAddr && bwd + (long)sizeAligned.ToUInt64() <= maxAddr)
+                        {
+                            IntPtr r = TryAllocNearAt(new IntPtr(bwd), sizeAligned, nearAddr, true, true);
+                            if (r != IntPtr.Zero) return r;
+                        }
+                    }
+                }
+                // Fallback: allocate anywhere
+                return VirtualAlloc(IntPtr.Zero, (UIntPtr)(ulong)size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
             }
 
-            for (long offset = 0; offset < HookConstants.MaxRel32Range; offset += step)
+            // ----- Linux / macOS -----
+            // On Linux, find a genuinely FREE address gap near `near` by parsing
+            // /proc/self/maps, then mmap that gap with MAP_FIXED (safe because it's
+            // unmapped). Without this, MAP_FIXED would silently overwrite existing
+            // mappings (JIT code / MethodTable / precode), causing SIGSEGV.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                // Forward: near + offset
+                IntPtr freeAddr = FindFreeAddressNearLinux(near, size, HookConstants.MaxRel32Range);
+                if (freeAddr != IntPtr.Zero)
+                {
+                    IntPtr r = TryAllocNearAt(freeAddr, sizeAligned, nearAddr, false, true);
+                    if (r != IntPtr.Zero) return r;
+                }
+            }
+
+            // macOS or Linux fallback: scan candidate addresses without MAP_FIXED
+            // (the address is only a hint; the kernel never overwrites an existing
+            // mapping). Each successful mmap is checked against the rel32 range.
+            if (minAddr < 65536) minAddr = 65536;
+            long psStep = HookConstants.PageSize;
+            for (long offset = 0; offset < HookConstants.MaxRel32Range; offset += psStep)
+            {
                 long fwd = near + offset;
                 if (fwd >= minAddr && fwd + (long)sizeAligned.ToUInt64() <= maxAddr)
                 {
-                    IntPtr r = TryAllocNearAt(new IntPtr(fwd), sizeAligned, nearAddr, isWindows);
+                    IntPtr r = TryAllocNearAt(new IntPtr(fwd), sizeAligned, nearAddr, false, false);
                     if (r != IntPtr.Zero) return r;
                 }
-
-                // Backward: near - offset
                 if (offset > 0)
                 {
                     long bwd = near - offset;
                     if (bwd >= minAddr && bwd + (long)sizeAligned.ToUInt64() <= maxAddr)
                     {
-                        IntPtr r = TryAllocNearAt(new IntPtr(bwd), sizeAligned, nearAddr, isWindows);
+                        IntPtr r = TryAllocNearAt(new IntPtr(bwd), sizeAligned, nearAddr, false, false);
                         if (r != IntPtr.Zero) return r;
                     }
                 }
             }
-
-            // Fallback: allocate anywhere
-            if (isWindows)
-                return VirtualAlloc(IntPtr.Zero, (UIntPtr)(ulong)size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            // Final fallback: allocate anywhere (may be out of rel32 range).
             return AllocExec(size);
+        }
+
+        /// <summary>
+        /// A mapped memory region from /proc/self/maps (any permission).
+        /// Used to find FREE (unmapped) address gaps for near allocation.
+        /// </summary>
+        private struct LinuxMappedRegion
+        {
+            public long Start;
+            public long End;
+        }
+
+        /// <summary>
+        /// Parses /proc/self/maps and returns ALL mapped regions (regardless of
+        /// permission). Unlike ParseLinuxMaps (which only returns readable
+        /// regions), this returns every mapped region so callers can identify
+        /// unmapped gaps suitable for mmap with MAP_FIXED.
+        /// Regions in /proc/self/maps are sorted by start address ascending.
+        /// Returns an empty array if /proc/self/maps cannot be read.
+        /// </summary>
+        private static LinuxMappedRegion[] ParseAllLinuxMappedRegions()
+        {
+            var regions = new System.Collections.Generic.List<LinuxMappedRegion>();
+            try
+            {
+                using (var fs = new System.IO.FileStream(
+                           "/proc/self/maps", System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read))
+                using (var sr = new System.IO.StreamReader(fs))
+                {
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        int dash = line.IndexOf('-');
+                        if (dash <= 0) continue;
+                        int space = line.IndexOf(' ', dash);
+                        if (space <= dash) continue;
+                        long start, end;
+                        if (!long.TryParse(line.Substring(0, dash), System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out start))
+                            continue;
+                        if (!long.TryParse(line.Substring(dash + 1, space - dash - 1), System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out end))
+                            continue;
+                        regions.Add(new LinuxMappedRegion { Start = start, End = end });
+                    }
+                }
+            }
+            catch
+            {
+                // /proc/self/maps unavailable
+            }
+            return regions.ToArray();
+        }
+
+        /// <summary>
+        /// Finds a FREE (unmapped) address gap of at least <paramref name="size"/>
+        /// bytes within ±<paramref name="range"/> of <paramref name="nearAddr"/> on
+        /// Linux, by parsing /proc/self/maps. The returned address is page-aligned
+        /// and guaranteed to be within the rel32 range of <paramref name="nearAddr"/>
+        /// so a 5-byte E9 relative jump can reach it.
+        ///
+        /// This is REQUIRED before calling mmap with MAP_FIXED: MAP_FIXED at an
+        /// already-mapped address SILENTLY OVERWRITES the existing mapping,
+        /// corrupting JIT code / MethodTable / precode and causing SIGSEGV.
+        ///
+        /// Returns IntPtr.Zero if no suitable gap is found or /proc/self/maps is
+        /// unavailable (caller falls back to the non-MAP_FIXED scan).
+        /// </summary>
+        private static IntPtr FindFreeAddressNearLinux(long nearAddr, long size, long range)
+        {
+            long pageSize = PageSize;
+            long allocSize = ((size + pageSize - 1) / pageSize) * pageSize;
+            // Avoid page 0; keep min within rel32 range of nearAddr.
+            long minAddr = Math.Max(nearAddr - range, pageSize);
+            long maxAddr = nearAddr + range - allocSize;
+            if (maxAddr < minAddr) return IntPtr.Zero;
+
+            var mapped = ParseAllLinuxMappedRegions();
+            if (mapped == null || mapped.Length == 0)
+                return IntPtr.Zero; // cannot determine free space safely
+
+            // /proc/self/maps is sorted by start address ascending. Walk through
+            // and find the first gap >= allocSize within [minAddr, maxAddr].
+            long searchStart = minAddr;
+            for (int i = 0; i < mapped.Length; i++)
+            {
+                long rStart = mapped[i].Start;
+                long rEnd = mapped[i].End;
+                if (rEnd <= searchStart) continue;       // region entirely before window
+                if (rStart > maxAddr) break;             // region entirely after window
+                // Gap between searchStart and rStart
+                if (rStart > searchStart)
+                {
+                    long gap = rStart - searchStart;
+                    if (gap >= allocSize)
+                    {
+                        // Page-align the candidate address.
+                        long addr = (searchStart + pageSize - 1) & ~(pageSize - 1);
+                        if (addr + allocSize <= rStart &&
+                            addr >= minAddr &&
+                            addr + allocSize - 1 <= maxAddr + allocSize - 1)
+                        {
+                            long delta = addr - nearAddr;
+                            if (delta >= -2147483647L && delta <= (long)int.MaxValue)
+                                return new IntPtr(addr);
+                        }
+                    }
+                }
+                searchStart = Math.Max(searchStart, rEnd);
+            }
+            // Check the gap after the last mapped region.
+            if (searchStart <= maxAddr)
+            {
+                long addr = (searchStart + pageSize - 1) & ~(pageSize - 1);
+                if (addr + allocSize - 1 <= maxAddr + allocSize - 1)
+                {
+                    long delta = addr - nearAddr;
+                    if (delta >= -2147483647L && delta <= (long)int.MaxValue)
+                        return new IntPtr(addr);
+                }
+            }
+            return IntPtr.Zero;
         }
 
         public static void FreeExec(IntPtr ptr, int size)
@@ -235,7 +404,7 @@ namespace Crane.MethodHook
         /// Prevents AccessViolationException (uncatchable in .NET 8) when scanning
         /// MethodDesc/MethodTable regions that may extend into unmapped memory.
         /// </summary>
-        public static bool IsReadable(IntPtr addr, int size)
+        public static unsafe bool IsReadable(IntPtr addr, int size)
         {
             if (addr == IntPtr.Zero)
             {
@@ -268,8 +437,175 @@ namespace Crane.MethodHook
                 return p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY
                     || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
             }
-            // Non-Windows: assume readable (mmap'd pages are readable until munmap'd)
-            return true;
+            // Linux: parse /proc/self/maps to verify the address range is both
+            // mapped AND readable. mincore(2) only checks mapping — it reports
+            // PROT_NONE guard pages (placed by the CLR at the end of MethodTable
+            // allocations on .NET 6 Linux) as "mapped", causing uncatchable
+            // AccessViolationException inside Marshal.ReadInt64 when the
+            // MethodTable scan walks past the live data into the guard page.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                return IsReadableLinux(addr, size);
+            }
+            // macOS / other Unix: fall back to mincore. macOS does not use
+            // PROT_NONE guard pages near CLR regions like Linux does, so mincore
+            // is sufficient there.
+            return IsReadableUnixMincore(addr, size);
+        }
+
+        /// <summary>
+        /// A memory region from /proc/self/maps with its start/end addresses.
+        /// Only regions whose permissions include 'r' (PROT_READ) are stored.
+        /// </summary>
+        private struct LinuxMemoryRegion
+        {
+            public long Start;
+            public long End;
+        }
+
+        /// <summary>
+        /// Cached snapshot of readable memory regions parsed from /proc/self/maps.
+        /// Built lazily on first IsReadableLinux call and refreshed when an
+        /// address is not found (maps may change due to JIT/GC activity).
+        /// Volatile so the lock-free fast path reads the most recent reference.
+        /// </summary>
+        private static volatile LinuxMemoryRegion[] _linuxReadableRegions;
+        private static readonly object _linuxMapsLock = new object();
+
+        private static LinuxMemoryRegion[] GetLinuxReadableRegions()
+        {
+            var cached = _linuxReadableRegions;
+            if (cached != null) return cached;
+            lock (_linuxMapsLock)
+            {
+                if (_linuxReadableRegions != null) return _linuxReadableRegions;
+                _linuxReadableRegions = ParseLinuxMaps();
+                return _linuxReadableRegions;
+            }
+        }
+
+        /// <summary>
+        /// Parses /proc/self/maps and returns an array of regions whose
+        /// permissions include read access (the 'r' permission bit).
+        /// Returns an empty array if /proc/self/maps cannot be read.
+        /// </summary>
+        private static LinuxMemoryRegion[] ParseLinuxMaps()
+        {
+            var regions = new System.Collections.Generic.List<LinuxMemoryRegion>();
+            try
+            {
+                using (var fs = new System.IO.FileStream(
+                           "/proc/self/maps", System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read))
+                using (var sr = new System.IO.StreamReader(fs))
+                {
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        // Format: start-end perm offset dev inode pathname
+                        // Example: 7f8b0c000000-7f8b0c021000 rw-p 00000000 00:00 0
+                        int dash = line.IndexOf('-');
+                        if (dash <= 0) continue;
+                        int space = line.IndexOf(' ', dash);
+                        if (space <= dash) continue;
+                        // Parse hex start and end addresses
+                        long start, end;
+                        if (!long.TryParse(line.Substring(0, dash), System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out start))
+                            continue;
+                        if (!long.TryParse(line.Substring(dash + 1, space - dash - 1), System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out end))
+                            continue;
+                        // Permission string starts at space+1; readable iff first char is 'r'
+                        int permIdx = space + 1;
+                        if (permIdx < line.Length && line[permIdx] == 'r')
+                        {
+                            regions.Add(new LinuxMemoryRegion { Start = start, End = end });
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // /proc/self/maps not available or unreadable — return empty so
+                // callers fall through to the conservative mincore path.
+            }
+            return regions.ToArray();
+        }
+
+        private static bool IsReadableLinux(IntPtr addr, int size)
+        {
+            long addrStart = addr.ToInt64();
+            long addrEnd = addrStart + size;
+
+            // Fast path: check the cached readable regions.
+            var regions = GetLinuxReadableRegions();
+            if (regions != null && regions.Length > 0)
+            {
+                if (IsInReadableRegions(regions, addrStart, addrEnd))
+                    return true;
+            }
+            else
+            {
+                // /proc/self/maps was unavailable — fall back to mincore so we
+                // don't regress compared to the previous "always readable" code.
+                return IsReadableUnixMincore(addr, size);
+            }
+
+            // Miss: the address may be in a region allocated after the cache was
+            // built (JIT/GC can allocate new code pages). Refresh once and retry.
+            lock (_linuxMapsLock)
+            {
+                _linuxReadableRegions = null;
+            }
+            regions = GetLinuxReadableRegions();
+            if (IsInReadableRegions(regions, addrStart, addrEnd))
+                return true;
+
+            return false;
+        }
+
+        private static bool IsInReadableRegions(LinuxMemoryRegion[] regions, long addrStart, long addrEnd)
+        {
+            // Linear scan: region count is typically a few hundred, and IsReadable
+            // is called in tight scan loops. If this proves too slow, switch to
+            // binary search on a sorted array.
+            for (int i = 0; i < regions.Length; i++)
+            {
+                if (addrStart >= regions[i].Start && addrEnd <= regions[i].End)
+                    return true;
+            }
+            return false;
+        }
+
+        private static unsafe bool IsReadableUnixMincore(IntPtr addr, int size)
+        {
+            long pageSize = PageSize;
+            IntPtr page = AlignToPage(addr);
+            long start = page.ToInt64();
+            long end = addr.ToInt64() + size;
+            // Round length up to a page boundary so mincore covers the full range.
+            long length = ((end - start + pageSize - 1) / pageSize) * pageSize;
+            if (length <= 0)
+            {
+                return true;
+            }
+            int pageCount = (int)(length / pageSize);
+            if (pageCount <= 0)
+            {
+                return true;
+            }
+            // stackalloc avoids per-call heap allocation in tight scan loops.
+            byte* vec = stackalloc byte[pageCount];
+            try
+            {
+                int rc = mincore(page, (UIntPtr)(ulong)length, vec);
+                return rc == 0;
+            }
+            catch
+            {
+                // mincore P/Invoke unavailable — preserve old "assume readable".
+                return true;
+            }
         }
 
         /// <summary>
@@ -378,5 +714,12 @@ namespace Crane.MethodHook
 
         [DllImport("libc", SetLastError = true)]
         private static extern int munmap(IntPtr addr, UIntPtr len);
+
+        // mincore(2): returns 0 if every page in [addr, addr+len) is mapped,
+        // -1 with errno=ENOMEM if any page is unmapped. Used by IsReadable on
+        // Linux/macOS to avoid uncatchable AccessViolationException when scanning
+        // past the end of mapped CLR regions (MethodDesc/MethodTable).
+        [DllImport("libc", SetLastError = true)]
+        private static extern unsafe int mincore(IntPtr addr, UIntPtr len, byte* vec);
     }
 }

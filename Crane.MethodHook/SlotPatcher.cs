@@ -63,8 +63,14 @@ namespace Crane.MethodHook
                             list.Add(methodTable + j);
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        // AccessViolationException is not catchable on .NET Core/.NET 6+
+                        // for AV originating from native code. This catch only handles
+                        // rare managed exceptions (e.g. from a bug in MemOps.ReadIntPtr).
+                        // The real protection is the Memory.IsReadable guard above, which
+                        // checks /proc/self/maps on Linux and VirtualQuery on Windows.
+                        Console.Error.WriteLine("[FindSlots] ReadIntPtr threw at mt+0x" + j.ToString("X") + " addr=0x" + (methodTable + j).ToInt64().ToString("X") + ": " + ex.GetType().Name + ": " + ex.Message);
                         break;
                     }
                 }

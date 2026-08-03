@@ -197,6 +197,19 @@ namespace Crane.MethodHook
         private bool _needsGenericAdapter;
 
         /// <summary>
+        /// Generic dictionary address extracted from the target method's fixup
+        /// thunk BEFORE EnsureJitCompiled backpatches the precode. On .NET 6, the
+        /// E9 precode for a generic method is backpatched to point directly to JIT
+        /// code, destroying the fixup thunk. Extracting the dictionary address
+        /// after backpatching fails (ExtractGenericDictionaryFromFixup returns
+        /// Zero), so the generic dictionary slot scan in InstallSlotReplacement is
+        /// skipped — direct call sites that load the code pointer from the
+        /// dictionary bypass the hook. This saved value is used as a fallback when
+        /// the live extraction fails.
+        /// </summary>
+        private IntPtr _savedGenericDictionaryAddr;
+
+        /// <summary>
         /// Re-entrancy guard for CallOriginal. When CallOriginal is executing
         /// (between RestoreAll and ReapplyAll), the patches are temporarily
         /// removed. If the delegate's Invoke method dispatches through the
@@ -294,6 +307,21 @@ namespace Crane.MethodHook
             // This replaces the former approach of calling the method 50 times
             // to force tier-1 promotion.
             bool tieredDisabled = TryDisableTieredCompilation(_targetMethod);
+            // For generic methods, extract the generic dictionary address from the
+            // fixup thunk BEFORE EnsureJitCompiled backpatches the precode. On .NET 6,
+            // the E9 precode is backpatched to point to JIT code, destroying the
+            // fixup thunk — so ExtractGenericDictionaryFromFixup would return Zero
+            // after backpatching. We save the address here and use it as a fallback
+            // in InstallSlotReplacement when the live extraction fails.
+            if (_targetMethod.IsGenericMethod)
+            {
+                try
+                {
+                    IntPtr preBackpatchFp = _targetMethod.MethodHandle.GetFunctionPointer();
+                    _savedGenericDictionaryAddr = ExtractGenericDictionaryFromFixup(preBackpatchFp);
+                }
+                catch (Exception ex) {  }
+            }
             EnsureJitCompiled(_targetMethod);
             IntPtr functionPointer = _targetMethod.MethodHandle.GetFunctionPointer();
             IntPtr functionPointer2 = _hookMethod.MethodHandle.GetFunctionPointer();

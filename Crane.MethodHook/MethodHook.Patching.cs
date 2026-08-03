@@ -14,44 +14,50 @@ namespace Crane.MethodHook
             // MethodDesc/MethodTable slots to dispatch method calls (esp. generic methods
             // whose call sites bypass the precode and call JIT code directly).
             //
-            // SKIP for generic methods: the brute-force memory scan (FindSlots) can
-            // produce false positives — data fields in the MethodTable or generic
-            // dictionary that happen to contain the same address as a function pointer.
-            // Patching these false positives corrupts runtime state and causes hangs.
-            // For generic methods, the precode patches (target1 data cell, target2 data
-            // cell, fixup thunk, and Target2JitPatch) are sufficient to redirect calls.
-            if (_needsGenericAdapter)
-            {
-                _slotAddresses = new List<IntPtr>();
-                _originalSlotValues = new List<IntPtr>();
-                diag.SlotCount = 0;
-                diag.CallOrigStatus = "Skipped for generic method (precode patches sufficient)";
-                return;
-            }
+            // For generic methods, the brute-force MethodDesc/MethodTable scan (FindSlots)
+            // is skipped because it can produce false positives — data fields in the
+            // MethodTable or generic dictionary that happen to contain the same address
+            // as a function pointer. Patching these false positives corrupts runtime
+            // state and causes hangs. Instead, generic methods rely on:
+            //   1. The precode patches (target1/target2 data cells, fixup thunk)
+            //   2. The generic dictionary scan below, which finds and patches the
+            //      dictionary slot holding the method's code pointer.
+            // The generic dictionary scan is ESSENTIAL on .NET 6 where call sites for
+            // generic methods load the code pointer from the dictionary and call it
+            // directly (CALL RAX), bypassing the precode entirely.
+            _slotAddresses = new List<IntPtr>();
+            _originalSlotValues = new List<IntPtr>();
             try
             {
-                IntPtr methodDesc = _targetMethod.MethodHandle.Value;
-                IntPtr methodTable = IntPtr.Zero;
-                Type declaringType = _targetMethod.DeclaringType;
-                if (declaringType != null)
+                if (!_needsGenericAdapter)
                 {
-                    methodTable = declaringType.TypeHandle.Value;
-                }
-                // For non-generic methods, skip MethodDesc scan (offsets 8/16 are
-                // entry-point fields — corrupting them breaks dispatch). The MethodTable
-                // scan (65536 bytes) may still overlap MethodDesc memory, so filter out
-                // any found slots that fall within the MethodDesc region afterwards.
-                IntPtr mdForScan = !_needsGenericAdapter ? methodDesc : IntPtr.Zero;
-                _slotAddresses = SlotPatcher.FindSlots(mdForScan, methodTable, targetPtr);
-                if (!_needsGenericAdapter && methodDesc != IntPtr.Zero)
-                {
-                    long mdStart = methodDesc.ToInt64();
-                    long mdEnd = mdStart + 128;
-                    _slotAddresses = _slotAddresses.FindAll(s =>
+                    IntPtr methodDesc = _targetMethod.MethodHandle.Value;
+                    IntPtr methodTable = IntPtr.Zero;
+                    Type declaringType = _targetMethod.DeclaringType;
+                    if (declaringType != null)
                     {
-                        long a = s.ToInt64();
-                        return a < mdStart || a >= mdEnd;
-                    });
+                        methodTable = declaringType.TypeHandle.Value;
+                    }
+                    // For non-generic methods, skip MethodDesc scan (offsets 8/16 are
+                    // entry-point fields — corrupting them breaks dispatch). The MethodTable
+                    // scan (65536 bytes) may still overlap MethodDesc memory, so filter out
+                    // any found slots that fall within the MethodDesc region afterwards.
+                    _slotAddresses = SlotPatcher.FindSlots(methodDesc, methodTable, targetPtr);
+                    if (methodDesc != IntPtr.Zero)
+                    {
+                        long mdStart = methodDesc.ToInt64();
+                        long mdEnd = mdStart + 128;
+                        _slotAddresses = _slotAddresses.FindAll(s =>
+                        {
+                            long a = s.ToInt64();
+                            return a < mdStart || a >= mdEnd;
+                        });
+                    }
+                    diag.CallOrigStatus = "MethodDesc/Table scan done";
+                }
+                else
+                {
+                    diag.CallOrigStatus = "MethodDesc/Table scan skipped for generic method";
                 }
 
                 // For generic methods, also scan the generic dictionary for the
@@ -62,7 +68,19 @@ namespace Crane.MethodHook
                 if (_targetMethod.IsGenericMethod)
                 {
                     IntPtr genDictAddr = ExtractGenericDictionaryFromFixup(targetPtr);
-                    diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictAddr=0x" + genDictAddr.ToInt64().ToString("X");
+                    // On .NET 6, EnsureJitCompiled backpatches the E9 precode to point
+                    // directly to JIT code, destroying the fixup thunk. The live
+                    // extraction above returns Zero in that case. Fall back to the
+                    // dictionary address saved BEFORE backpatching (in StartHookCore).
+                    if (genDictAddr == IntPtr.Zero && _savedGenericDictionaryAddr != IntPtr.Zero)
+                    {
+                        genDictAddr = _savedGenericDictionaryAddr;
+                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictAddr(saved)=0x" + genDictAddr.ToInt64().ToString("X");
+                    }
+                    else
+                    {
+                        diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; GenDictAddr=0x" + genDictAddr.ToInt64().ToString("X");
+                    }
                     if (genDictAddr != IntPtr.Zero)
                     {
                         // The generic dictionary slot may hold ANY address in the
@@ -96,6 +114,17 @@ namespace Crane.MethodHook
                                 foreach (var s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, jitFromFixup, dictScanSize))
                                     if (!dictSlots.Contains(s)) dictSlots.Add(s);
                             }
+                        }
+                        // Also try the SAVED pre-backpatch addresses. On .NET 6, after
+                        // EnsureJitCompiled backpatches the precode, the dictionary slot
+                        // may hold the original fixup thunk address (which is no longer in
+                        // the ResolveChain because the precode was backpatched). Search
+                        // for the precode address and any saved dictionary-relevant
+                        // addresses directly.
+                        {
+                            // Search for the precode address itself
+                            foreach (var s in SlotPatcher.FindSlots(genDictAddr, IntPtr.Zero, targetPtr, dictScanSize))
+                                if (!dictSlots.Contains(s)) dictSlots.Add(s);
                         }
                         foreach (IntPtr s in dictSlots)
                         {
@@ -468,7 +497,8 @@ namespace Crane.MethodHook
                         // precode was backpatched to point directly to JIT code).
                         // Resolve the real entry and patch the JIT code directly.
                         IntPtr realJit = MethodEntryResolver.ResolveRealEntry(targetPtr);
-                        if (realJit != IntPtr.Zero && realJit != targetPtr && LooksLikeRealJitCode(realJit))
+                        bool looksJit = realJit != IntPtr.Zero && realJit != targetPtr && LooksLikeRealJitCode(realJit);
+                        if (looksJit)
                         {
                             _innerCodeAddress = realJit;
                             _innerCodeOriginalBytes = MemOps.ReadBytes(realJit, 12);
@@ -907,8 +937,15 @@ namespace Crane.MethodHook
                 if (b0 >= 0x50 && b0 <= 0x57)
                 {
                     if (b1 >= 0x50 && b1 <= 0x57) return true;  // another PUSH
-                    if (b1 == 0x48 || b1 == 0x4C) return true;  // REX prefix
-                    if (b1 == 0x40) return true;                 // REX prefix
+                    // Any REX prefix (0x40-0x4F) is valid here. RyuJIT emits
+                    // prologues like "55 41 57" (PUSH RBP; PUSH R15) where the
+                    // second byte 0x41 is REX.B. Previously only 0x40/0x48/0x4C
+                    // were recognized, causing real JIT code starting with
+                    // "PUSH RBP; REX.B PUSH rXX" to be misclassified as data
+                    // and skipped — leaving direct call sites unpatched (the
+                    // hook silently failed on .NET 6 for methods like
+                    // List<int>.ConvertAll<string>).
+                    if (b1 >= 0x40 && b1 <= 0x4F) return true;  // REX prefix
                     return false;  // likely DATA structure
                 }
                 // Some JIT code starts with MOV or LEA
@@ -1362,6 +1399,7 @@ namespace Crane.MethodHook
                         // before patching target1, otherwise ResolveRealEntry would
                         // follow our patch and resolve to the hook address.
                         IntPtr realJit = MethodEntryResolver.ResolveRealEntry(innerCodeAddr);
+                        byte[] realJitBytes = MemOps.ReadBytesSafe(realJit, 16);
                         if (realJit != IntPtr.Zero && realJit != innerCodeAddr)
                         {
                             diag.CallOrigStatus = (diag.CallOrigStatus ?? "") + "; ResolvedInner->RealJit 0x" + realJit.ToInt64().ToString("X");
